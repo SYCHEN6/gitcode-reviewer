@@ -164,7 +164,7 @@
   "properties": {
     "task_id":     { "type": "string", "description": "全局唯一任务 ID" },
     "agent_type":  { "type": "string", "enum": ["SecurityAgent","LogicAgent","QualityAgent","PerformanceAgent"] },
-    "project_id":  { "type": "integer" },
+    "project_id":  { "type": "string", "description": "owner/repo 格式，如 chensiyu47/repo" },
     "mr_iid":      { "type": "integer" },
     "file_chunk":  { "type": "array", "items": { "type": "string" }, "description": "本 Agent 负责的文件列表" },
     "diff_slice":  { "type": "string", "description": "对应文件的 diff 片段" }
@@ -189,8 +189,9 @@
       "enum": ["security", "logic", "quality", "performance"]
     },
     "file":             { "type": "string" },
-    "line_start":       { "type": "integer" },
+    "line_start":       { "type": "integer", "description": "文件源码行号（展示用）" },
     "line_end":         { "type": "integer" },
+    "diff_position":    { "type": "integer", "description": "diff 行偏移量（从 @@ 后第1行算起），作为 post_inline_comment 的 position 参数" },
     "description":      { "type": "string", "description": "问题描述，面向开发者" },
     "suggestion_code":  { "type": "string", "description": "建议替换的代码内容，用于 suggestion block" },
     "norm_reference":   { "type": "string", "description": "引用的团队规范片段（QualityAgent 专用）" }
@@ -262,7 +263,7 @@
   "type": "object",
   "required": ["project_id", "mr_iid", "file_path", "line_number", "parent_comment"],
   "properties": {
-    "project_id":      { "type": "integer" },
+    "project_id":      { "type": "string", "description": "owner/repo 格式" },
     "mr_iid":          { "type": "integer" },
     "file_path":       { "type": "string" },
     "line_number":     { "type": "integer" },
@@ -300,8 +301,9 @@ class Finding(TypedDict):
     severity:        str   # CRITICAL / HIGH / MEDIUM / LOW
     category:        str   # security / logic / quality / performance
     file:            str
-    line_start:      int
+    line_start:      int   # 文件源码行号（展示用）
     line_end:        int
+    diff_position:   int   # diff 行偏移量，post_inline_comment 的 position 参数
     description:     str
     suggestion_code: str
     norm_reference:  str   # QualityAgent 引用的团队规范片段
@@ -316,7 +318,7 @@ class SummaryOutput(TypedDict):
 
 class ReviewState(TypedDict):
     # 输入
-    project_id:  int
+    project_id:  str   # "owner/repo" 格式
     mr_iid:      int
     commit_sha:  str
     raw_diff:    str
@@ -390,8 +392,8 @@ publish_node 统一写回
 
 **Webhook Secret 验证：**
 ```python
-# 验证 X-Gitlab-Token header，防止伪造请求
-if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
+# 验证 X-Gitcode-Token header，防止伪造请求（GitCode 发送的是 X-Gitcode-Token，非 X-Gitlab-Token）
+if request.headers.get("X-Gitcode-Token") != settings.WEBHOOK_SECRET:
     raise HTTPException(status_code=401)
 ```
 
@@ -502,7 +504,10 @@ if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
 
 ### 8. GitCode MCP Server（`src/mcp/gitcode_server.py`）
 
-封装 GitCode（GitLab v4 兼容）REST API，暴露为 MCP 工具。
+封装 GitCode v5 REST API（GitHub/Gitee 风格，非 GitLab v4 兼容），暴露为 MCP 工具。
+
+- API 基础路径：`{base_url}/api/v5/repos/{owner}/{repo}/...`
+- `project_id` 全局使用 `"owner/repo"` 字符串（如 `"chensiyu47/MindIE-SD_1344"`），不是整数
 
 **传输协议：Streamable HTTP**（MCP 2025 规范推荐，双向流，替代旧版 SSE）
 - MCP Server 作为独立 FastAPI 应用运行，端口 8081
@@ -521,18 +526,20 @@ if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
 ```json
 // get_pr_diff
 {
-  "input":  { "project_id": "integer", "mr_iid": "integer" },
+  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer" },
   "output": {
-    "diff": "string",
-    "base_sha": "string",
-    "head_sha": "string",
-    "start_sha": "string"
+    "diff":      "string  ← 拼接后的 unified diff 文本",
+    "files":     ["string"],
+    "diffs":     [{}],
+    "head_sha":  "string  ← inline comment 的 commit_id",
+    "base_sha":  "string",
+    "start_sha": "string  ← 等同 base_sha（GitCode v5 无独立 start_sha）"
   }
 }
 
 // get_file_content
 {
-  "input":  { "project_id": "integer", "file_path": "string", "ref": "string" },
+  "input":  { "project_id": "string (owner/repo)", "file_path": "string", "ref": "string" },
   "output": { "content": "string" }
 }
 
@@ -546,19 +553,16 @@ if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
   }
 }
 
-// post_inline_comment（GitLab position 对象必传）
+// post_inline_comment（GitCode v5 风格 position）
 {
   "input": {
-    "project_id": "integer",
+    "project_id": "string (owner/repo)",
     "mr_iid":     "integer",
     "body":       "string",
     "position": {
-      "base_sha":       "string  ← 来自 get_pr_diff.base_sha",
-      "start_sha":      "string  ← 来自 get_pr_diff.start_sha",
-      "head_sha":       "string  ← 来自 get_pr_diff.head_sha",
-      "position_type":  "text",
-      "new_path":       "string  ← file_path",
-      "new_line":       "integer ← Finding.line_start"
+      "head_sha":  "string  ← 来自 get_pr_diff.head_sha，作为 commit_id",
+      "new_path":  "string  ← 文件路径",
+      "new_line":  "integer ← diff 中的行偏移量（Finding.diff_position）"
     }
   },
   "output": { "comment_id": "integer" }
@@ -567,7 +571,7 @@ if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
 // post_suggestion（body 内嵌 suggestion block）
 {
   "input": {
-    "project_id":      "integer",
+    "project_id":      "string (owner/repo)",
     "mr_iid":          "integer",
     "suggestion_code": "string",
     "position":        "同 post_inline_comment.position"
@@ -577,18 +581,18 @@ if request.headers.get("X-Gitlab-Token") != settings.WEBHOOK_SECRET:
 
 // update_mr_description
 {
-  "input":  { "project_id": "integer", "mr_iid": "integer", "body": "string" },
+  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer", "body": "string" },
   "output": { "success": "boolean" }
 }
 
-// update_mr_label
+// update_mr_label（labels 必须是仓库已有标签名，不可为空数组）
 {
-  "input":  { "project_id": "integer", "mr_iid": "integer", "labels": ["string"] },
+  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer", "labels": ["string"] },
   "output": { "success": "boolean" }
 }
 ```
 
-> **说明：** `post_inline_comment` 的 `position` 对象中 `base_sha / start_sha / head_sha` 必须来自当次 `get_pr_diff` 的返回值，publish_node 负责在调用写入工具前先调一次 `get_pr_diff` 拿到这三个值。
+> **说明：** `post_inline_comment` 的 `position.new_line` 是 **diff 行偏移量**（从 `@@` 行后第 1 行算起的计数），不是文件行号。publish_node 在调用前须先通过 `get_pr_diff` 拿到 `head_sha`，并从 diff 文本计算每条 Finding 对应的 `diff_position`（Finding Schema 新增字段）。
 
 ---
 
@@ -666,7 +670,7 @@ python -m src.tools.ingest_norms --path ./docs/java_guidelines.pdf
 ```sql
 CREATE TABLE review_tasks (
     id           BIGINT PRIMARY KEY AUTO_INCREMENT,
-    project_id   BIGINT      NOT NULL,
+    project_id   VARCHAR(200) NOT NULL COMMENT 'owner/repo 格式，如 chensiyu47/repo',
     mr_iid       INT         NOT NULL,
     commit_sha   VARCHAR(40) NOT NULL,
     status       ENUM('pending','running','done','failed') DEFAULT 'pending',
@@ -726,8 +730,8 @@ CREATE TABLE suggestion_status (
 ### MR 自动检视流程
 
 ```
-1.  GitCode 推送 merge_request Webhook
-2.  验证 X-Gitlab-Token
+1.  GitCode 推送 merge_request Webhook（header: X-Gitcode-Event / X-Gitcode-Token）
+2.  验证 X-Gitcode-Token
 3.  Redis 幂等检查：key review:{project_id}:{mr_iid}:{commit_sha} 存在 → 跳过
 4.  MySQL 写入 review_tasks（status=pending）
 5.  启动 LangGraph ReviewOrchestrator（异步，FastAPI 立即返回 202）

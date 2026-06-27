@@ -26,3 +26,4 @@ pydantic>=2.0.0
 # 开发
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
+respx>=0.20.0

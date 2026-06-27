@@ -2,27 +2,28 @@
 
 ## 阶段划分
 
-### Phase 1 — 基础链路（目标：跑通端到端流程）
+### Phase 1 — 基础链路 ✅
 
 **目标：** MR 创建后能触发检视，结果写回 GitCode inline comment。
 
-- [ ] `src/tools/gitcode_client.py` — GitCode REST API 封装
-  - 拉取 MR diff
+- [x] `src/tools/gitcode_client.py` — GitCode v5 REST API 封装（`/api/v5/repos/{owner}/{repo}/...`）
+  - 拉取 MR diff（patch 为嵌套 dict，取 patch["diff"]）
   - 获取文件内容
-  - 发送 inline comment
+  - 发送 inline comment（position = diff 行偏移量）
   - 发送 suggestion block
   - 更新 MR 描述
-- [ ] `src/webhook/main.py` — FastAPI Webhook 入口
-  - 接收 merge_request 事件
+  - 查询/设置标签（labels 必须非空且为仓库已有名称）
+- [x] `src/webhook/main.py` — FastAPI Webhook 入口
+  - 接收 merge_request 事件（header: X-Gitcode-Token / X-Gitcode-Event）
   - 接收 note 事件
   - CommandParser（解析 /ai 命令）
-  - Redis 幂等去重
-- [ ] `src/mcp/gitcode_server.py` — GitCode MCP Server
-  - 基于 python MCP SDK
-  - 封装 gitcode_client 为 MCP 工具
-- [ ] 单 Agent 验证：用一个简单 Agent 调 MCP 工具跑通完整链路
+  - Redis 幂等去重（project_id = path_with_namespace 字符串 "owner/repo"）
+- [x] `src/mcp/gitcode_server.py` — GitCode MCP Server（FastMCP Streamable HTTP，端口 8081）
+  - 封装 gitcode_client 为 7 个 MCP 工具
+- [x] 单 Agent 验证（`src/agents/simple_reviewer.py`）：调 MCP 工具跑通完整链路
+- [x] 验证脚本（`scripts/verify_phase1.py`）：7 步端到端验证，6/7 通过（标签跳过，仓库暂无标签）
 
-**验收标准：** 在 GitCode 上创建测试 MR，服务自动写回一条 inline comment。
+**验收标准：** ✅ 服务已自动向测试 MR 写回评论。Phase 2 开始前需先在仓库创建 `ai-risk:high` / `ai-risk:low` 标签。
 
 ---
 
