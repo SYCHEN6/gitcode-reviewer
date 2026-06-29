@@ -35,7 +35,7 @@ def test_webhook_rejects_wrong_token():
     assert r.status_code == 401
 
 
-@patch("src.webhook.handlers.run_simple_review", new_callable=AsyncMock)
+@patch("src.webhook.handlers.run_review_graph", new_callable=AsyncMock)
 @patch("src.webhook.main._get_redis")
 def test_webhook_accepts_merge_request(mock_redis_factory, mock_review, monkeypatch):
     monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
@@ -57,7 +57,7 @@ def test_webhook_accepts_merge_request(mock_redis_factory, mock_review, monkeypa
     assert r.json()["status"] == "accepted"
 
 
-@patch("src.webhook.handlers.run_simple_review", new_callable=AsyncMock)
+@patch("src.webhook.handlers.run_review_graph", new_callable=AsyncMock)
 @patch("src.webhook.main._get_redis")
 def test_webhook_deduplicates_same_commit(mock_redis_factory, mock_review):
     mock_redis = AsyncMock()

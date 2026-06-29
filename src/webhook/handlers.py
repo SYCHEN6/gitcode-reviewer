@@ -7,7 +7,7 @@ import time
 import redis.asyncio as aioredis
 from fastapi import BackgroundTasks
 
-from src.agents.simple_reviewer import run_simple_review
+from src.graph.review_graph import run_review_graph
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ async def handle_merge_request(
         return
 
     await redis.setex(redis_key, _REDIS_TTL, "running")
-    background_tasks.add_task(run_simple_review, project_id, mr_iid, commit_sha)
+    background_tasks.add_task(run_review_graph, project_id, mr_iid, commit_sha)
     logger.info("Queued review for project=%s mr=%s sha=%s", project_id, mr_iid, commit_sha)
 
 
@@ -61,7 +61,7 @@ async def handle_note(
         commit_sha = f"cmd:{int(time.time())}"
         redis_key = f"review:{project_id}:{mr_iid}:{commit_sha}"
         await redis.setex(redis_key, _REDIS_TTL, "running")
-        background_tasks.add_task(run_simple_review, project_id, mr_iid, commit_sha)
+        background_tasks.add_task(run_review_graph, project_id, mr_iid, commit_sha)
         logger.info("/ai review triggered for project=%s mr=%s", project_id, mr_iid)
     else:
         logger.info("Ignored note command: %r", note_body)
