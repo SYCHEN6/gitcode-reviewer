@@ -372,6 +372,8 @@ async def run_expert_agent(
     languages: list[str] = task.get("languages", [])
     # 跨 Agent 共享的文件内容缓存（由 run_agents_node 创建，减少重复 HTTP 拉取）
     file_cache: dict[str, str] | None = task.get("_file_cache")
+    # token 统计输出 dict（由 run_agents_node 注入，写回后供 save_agent_result 使用）
+    _token_stats: dict | None = task.get("_token_stats")
 
     gc = GitCodeClient(settings.GITCODE_BASE_URL, settings.GITCODE_TOKEN)
 
@@ -482,9 +484,15 @@ async def run_expert_agent(
                     agent_type, i + 1, len(findings),
                     total_in_tokens, total_out_tokens, total_in_tokens + total_out_tokens,
                 )
+                if _token_stats is not None:
+                    _token_stats["tokens_in"] = total_in_tokens
+                    _token_stats["tokens_out"] = total_out_tokens
                 return findings
             # i == 0 且 findings 为空：可能模型不支持工具调用，降级为预取模式
             logger.info("[%s] No tool calls on first iteration (sufficient context), falling back to prefetch", agent_type)
+            if _token_stats is not None:
+                _token_stats["tokens_in"] = total_in_tokens
+                _token_stats["tokens_out"] = total_out_tokens
             return await _run_prefetch_fallback(agent_type, system_prompt, task, head_sha, gc, model, file_cache)
 
         # 执行工具调用（按名称路由到对应工具）
@@ -501,6 +509,9 @@ async def run_expert_agent(
             ))
 
     # 超出最大轮次：从最后一条 AI 消息里尝试提取 findings
+    if _token_stats is not None:
+        _token_stats["tokens_in"] = total_in_tokens
+        _token_stats["tokens_out"] = total_out_tokens
     for msg in reversed(messages):
         if hasattr(msg, "content") and msg.content and not getattr(msg, "tool_calls", None):
             findings = _parse_findings(msg.content, agent_type)

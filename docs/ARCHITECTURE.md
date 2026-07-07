@@ -58,13 +58,13 @@
 │  └──────────────────────────────────────────────────────────┘   │
 │                       │ FINISH                                   │
 │                       ▼                                         │
-│              ┌─────────────────┐                                │
-│              │  Summary Agent  │  单次 LLM 调用                  │
-│              └────────┬────────┘                                │
-│                       ▼                                         │
 │  synthesize_node  去重（per-agent 最高 severity + 描述去重）      │
 │                       ▼                                         │
 │    critic_node   行号验证 + 内容合理性过滤（Reflection）          │
+│                       ▼                                         │
+│              ┌─────────────────┐                                │
+│              │  Summary Agent  │  单次 LLM 调用                  │
+│              └────────┬────────┘                                │
 │                       ▼                                         │
 │     publish_node  统一写回 GitCode（跨轮去重 + 结构化摘要）       │
 └─────────────────────────────────────────────────────────────────┘
@@ -339,6 +339,19 @@ run_review_graph 内部：
 |---------|-----------|------|
 | MR 自动触发 | `review:{project_id}:{mr_iid}:{commit_sha}` | 存在则跳过，防止同一 commit 重复检视 |
 | `/ai review` 命令 | `review:{project_id}:{mr_iid}:cmd:{timestamp}` | 每次命令生成新 key，始终执行 |
+| `/ai explain` 命令 | `explain:{project_id}:{mr_iid}:{note_id}` | 存在则跳过，防止 Webhook 重复投递 |
+
+**`/ai explain` — edit-in-place 机制：**
+
+GitCode v5 无评论 threading/reply API，所有 reply 调用均生成独立评论。为避免 AI 解释和用户命令分裂成两条评论，采用 edit-in-place 策略：
+
+1. 调用 `get_pr_comment(note_id)` 获取原始评论内容
+2. 检查是否已含 `_EXPLAIN_MARKER`（`<!-- __AI_EXPLAIN_APPENDED_7f3a__ -->`）
+3. 未含 marker → 拼接 `{原文}\n\n{marker}\n\n{AI 解释}` → `update_pr_comment()` 就地修改
+4. 已含 marker → 幂等跳过（防止并发重入后的重复追加）
+5. `update_pr_comment` 失败时降级 → `post_mr_note` 发布独立评论
+
+LLM 输出在写入前做 `.replace(_EXPLAIN_MARKER, "")` 清洗，防止 LLM 自行在输出中生成该 marker 导致误判。
 
 ---
 
@@ -407,11 +420,11 @@ Supervisor 使用 qwen（DashScope）。
 
 ### 6. publish_node（跨轮去重 + 写回）
 
-1. 拉取 PR 现有评论，通过 `_parse_reported_keys()` 提取已报告的三元组：`(file, line_start, description[:40])`
-2. 只对新发现（三元组不在已报告集合中）发布 inline comment
+1. 拉取 PR 现有评论，通过 `_parse_reported_keys()` 提取已报告的二元组：`(file, line_start)`
+2. 只对新发现（(file, line_start) 二元组不在已报告集合中）发布 inline comment
 3. 发布格式：`{emoji} **[{SEVERITY}]** \`{file}:{line}\`\n\n{description}`，有建议时附 suggestion block
 4. 更新/创建 AI 摘要评论（含问题清单 + 风险等级 + 统计）
-5. 设置 `ai-risk:high` / `ai-risk:low` 标签
+5. 设置 `ai-risk-high` / `ai-risk-low` 标签
 
 ---
 
@@ -439,8 +452,10 @@ Supervisor 使用 qwen（DashScope）。
 | `list_directory` | 获取目录文件列表（新增文件上下文感知） |
 | `post_inline_comment` | 发送行内评论 |
 | `post_suggestion` | 发送代码建议 block |
+| `post_mr_note` | 发送 PR 全局评论（无 position） |
+| `get_pr_comment` | 获取单条评论内容（`/ai explain` edit-in-place 用） |
 | `get_pr_comments` | 获取现有评论（跨轮去重用） |
-| `update_pr_comment` | 更新 AI 摘要评论 |
+| `update_pr_comment` | 编辑已有评论（`/ai explain` 追加解释用） |
 | `update_mr_label` | 设置风险等级标签 |
 
 ---
@@ -507,26 +522,32 @@ CREATE TABLE review_results (
 
 ```sql
 CREATE TABLE suggestion_status (
-    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-    task_id     BIGINT NOT NULL,
-    finding_id  VARCHAR(36) NOT NULL COMMENT 'Finding.finding_id UUID',
-    comment_id  BIGINT NOT NULL COMMENT 'GitCode 写回的 comment ID',
-    file_path   VARCHAR(500) NOT NULL,
-    line_number INT NOT NULL,
-    severity    ENUM('CRITICAL','HIGH','MEDIUM','LOW') NOT NULL,
-    status      ENUM('open','applied','dismissed') DEFAULT 'open',
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_task_file (task_id, file_path),
-    INDEX idx_finding (finding_id)
+    id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    task_id      VARCHAR(64)  NOT NULL,
+    finding_id   VARCHAR(64)  NOT NULL COMMENT 'Finding.finding_id UUID',
+    project_id   VARCHAR(255),
+    mr_iid       INT,
+    comment_id   BIGINT,
+    file_path    VARCHAR(500),
+    line_start   INT,
+    severity     VARCHAR(20)  DEFAULT 'LOW',
+    status       VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    applied_at   DATETIME,
+    UNIQUE KEY   uq_finding (finding_id),
+    INDEX        idx_task (task_id),
+    INDEX        idx_project_mr (project_id, mr_iid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 **风险等级重算逻辑（suggestion apply 后触发）：**
 ```
-查询 task_id 关联的所有 suggestion_status
-  → 统计 severity IN ('CRITICAL','HIGH') AND status='open' 的数量 N
-  → N == 0 : update_mr_label(['ai-risk:low'])
-  → N  > 0 : update_mr_label(['ai-risk:high'])
+push Webhook → _mark_suggestions_applied(project_id, file_paths)
+  → get_open_mr_ids(project_id, file_paths)   # apply 前查出涉及的 MR
+  → mark_suggestions_applied()                 # 更新 status=applied
+  → 对每个 mr_iid：
+      count_open_critical_high(project_id, mr_iid)  # 剩余 CRITICAL/HIGH pending 数 N
+      N > 0 : update_mr_label(['ai-risk-high'])
+      N == 0 : update_mr_label(['ai-risk-low'])
 ```
 
 ---
@@ -554,7 +575,7 @@ CREATE TABLE suggestion_status (
 12. synthesize_node 去重排序 → critic_node 质量过滤
 13. summary_node 生成检视摘要（SummaryOutput JSON）
 14. publish_node：
-    - 跨轮去重（拉现有评论，三元组比对）
+    - 跨轮去重（拉现有评论，(file, line_start) 二元组比对；同行 LLM 措辞不同也视为重复）
     - 发布 inline comment + suggestion block
     - 更新/创建 AI 摘要评论
     - 设置风险标签
@@ -566,7 +587,7 @@ CREATE TABLE suggestion_status (
 
 ```
 1.  push Webhook → 匹配 commit msg r"Apply \d* ?suggestion"
-2.  查 suggestion_status WHERE file_path IN (...) AND status='open'
-3.  更新 status='applied'
-4.  重算风险等级 → update_mr_label
+2.  get_open_mr_ids(project_id, file_paths) → 获取涉及的 MR 列表
+3.  mark_suggestions_applied() → 更新 status='applied'，记录 applied_at
+4.  对每个 mr_iid：count_open_critical_high() → 重算 ai-risk 标签
 ```

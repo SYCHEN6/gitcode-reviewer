@@ -11,6 +11,8 @@
 - run_agents_node：Step Checkpoint 恢复（跳过已完成 Agent）
 """
 
+import uuid
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -439,25 +441,30 @@ async def test_run_agents_saves_checkpoint_after_completion():
 
 # ── synthesize_node: finding_id 分配 ─────────────────────────────────────────
 
-def test_synthesize_assigns_finding_ids():
-    """synthesize_node 的每条 final finding 都应有 finding_id (UUID hex)。"""
+def test_synthesize_preserves_finding_ids():
+    """synthesize_node 保留由 _parse_findings 预先分配的 finding_id（UUID 带连字符，36 字符）。
+
+    finding_id 由 expert_agent._parse_findings 在 Agent 运行时分配，不由 synthesize_node 生成。
+    """
+    fid_a = str(uuid.uuid4())
+    fid_b = str(uuid.uuid4())
     state = {
         "findings": [
             {"agent": "QualityAgent", "file": "a.py", "line_start": 10,
-             "severity": "HIGH", "description": "issue A"},
+             "severity": "HIGH", "description": "issue A", "finding_id": fid_a},
             {"agent": "SecurityAgent", "file": "a.py", "line_start": 20,
-             "severity": "MEDIUM", "description": "issue B"},
+             "severity": "MEDIUM", "description": "issue B", "finding_id": fid_b},
         ],
         "diffs": [],
     }
     result = synthesize_node(state)
-    for f in result["final_findings"]:
-        assert "finding_id" in f
-        assert len(f["finding_id"]) == 32  # UUID hex
+    ids = {f["finding_id"] for f in result["final_findings"]}
+    assert fid_a in ids
+    assert fid_b in ids
 
 
 def test_synthesize_finding_id_not_overwritten():
-    """已有 finding_id 的 finding 不应被重新分配。"""
+    """synthesize_node 不修改已有的 finding_id。"""
     state = {
         "findings": [
             {"agent": "QualityAgent", "file": "a.py", "line_start": 10,

@@ -60,10 +60,12 @@ SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAc
   ↓ findings 通过 operator.add 聚合到 State
   ↓ 回到 Supervisor 再次推理
   ↓ FINISH
-  SummaryAgent（单次 LLM 调用）→ synthesize_node → critic_node → publish_node
+  synthesize_node → critic_node → SummaryAgent（单次 LLM 调用）→ publish_node
 ```
 
 **首轮使用规则引擎的原因**：LLM 决策在边界情况下输出格式不稳定，规则引擎保证 Agent 集合的确定性。`focus_hint` 仍由 LLM 生成，保留语义理解能力。`_enforce_tier_rules` 在 Supervisor 决策之后做结构性纠正（per-file 拆批、文件数限制）。
+
+**函数位置**：`_rule_engine_dispatch` 定义在 `src/graph/review_graph.py`（与 LangGraph 节点同文件）；`get_focus_hints` 定义在 `src/agents/supervisor.py`。
 
 ### 并发控制（Redis 分布式）
 
@@ -88,16 +90,37 @@ SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAc
 1. 调用 `GitCodeClient.list_directory()` 获取目标目录现有文件列表
 2. 将目录结构注入 Agent 上下文，帮助发现命名冲突、功能重复实现等问题
 
+### /ai explain Edit-in-Place 机制
+
+`/ai explain` 命令**不**新建评论，而是将 AI 解释追加到触发评论本身（edit-in-place）：
+
+1. 从 note 事件的 `object_attributes.id` 提取 `note_id`
+2. Redis 幂等检查：`explain:{project_id}:{mr_iid}:{note_id}`，已处理则跳过
+3. `gc.get_pr_comment(project_id, note_id)` 读取原始评论内容
+4. 提取代码片段：支持 `file:line` 引用格式和 ` ``` ` 代码块格式
+5. 调用 LLM 生成解释，清理 markdown 代码块包装
+6. 将解释以 `_EXPLAIN_MARKER`（`<!-- __AI_EXPLAIN_APPENDED_7f3a__ -->`）分隔追加到原评论
+7. `gc.update_pr_comment(project_id, mr_iid, note_id, new_body)` 更新评论
+
+### Suggestion Apply → 风险标签重算
+
+push 事件触发 `_mark_suggestions_applied` 时，在标记 `applied` 之前先查询受影响的 MR：
+
+1. `repository.get_open_mr_ids(project_id, file_paths)` 获取包含 pending suggestion 的 MR 列表
+2. `repository.mark_suggestions_applied(project_id, file_paths)` 批量更新状态为 `applied`
+3. 对每个 MR：`repository.count_open_critical_high(project_id, mr_iid)` 统计剩余高危 suggestion
+4. 调用 `gc.update_mr_label()` 更新标签：有剩余高危 → `ai-risk-high`；全部修复 → `ai-risk-low`
+
 ### 工具分层（严格隔离）
 
 - **读取工具**（专家 Agent ReAct 循环内调用）：`get_pr_diff` / `get_file_content` / `search_team_norms`
-- **写入工具**（仅 `publish_node` 调用）：`post_inline_comment` / `post_suggestion` / `update_mr_description` / `update_mr_label`
+- **写入工具**（仅 `publish_node` 调用）：`post_inline_comment` / `post_suggestion` / `post_mr_note` / `update_pr_comment` / `update_mr_label`
 
 专家 Agent 绝不直接写 GitCode，所有写回统一由 publish_node 处理，保证结果有序且原子。
 
 ### MCP Server
 
-`src/mcp/gitcode_server.py` 封装 GitCode（GitLab v4 兼容）REST API，使用 **Streamable HTTP** 协议（MCP 2025 规范），独立运行在端口 8081。Agent 通过 MCP Client 调用工具，不直接依赖 `python-gitlab`。
+`src/mcp/gitcode_server.py` 封装 GitCode（GitLab v4 兼容）REST API，使用 **Streamable HTTP** 协议（MCP 2025 规范），独立运行在端口 8081。该 MCP Server 供外部 MCP Client 使用；专家 Agent **不**通过 MCP 调用工具，而是通过 `src/tools/gitcode_client.py`（`GitCodeClient` 自研 httpx 封装）直接访问 GitCode v5 REST API。
 
 ### RAG 知识库
 
@@ -109,16 +132,18 @@ SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAc
 
 - `SupervisorDecision`：Supervisor 每轮输出，含 `action` / `reasoning` / `agents_to_dispatch`
 - `AgentTask`：Supervisor 下发给专家 Agent 的任务，含 `file_chunk` + `diff_slice` + `focus_hint`
-- `Finding`：专家 Agent 统一输出格式，含 `finding_id`（UUID）用于 suggestion_status 追踪
+- `Finding`：专家 Agent 统一输出格式，含 `finding_id`（UUID，在 `expert_agent._parse_findings` 中通过 `str(uuid.uuid4())` 生成，synthesize_node 保留不覆盖）用于 suggestion_status 追踪
 - `SummaryOutput` / `ExplainResponse`：对应 Agent 的输出
 
 ## 数据持久化
 
-- **MySQL**：`review_tasks`（任务状态 + tier/languages）/ `review_results`（Agent 级输出，含 tokens_in/out/duration_ms）/ `suggestion_status`（建议应用追踪，含 `finding_id` 外键）
+- **MySQL**：`review_tasks`（任务状态 + tier/languages）/ `review_results`（Agent 级输出，含 tokens_in/out/duration_ms）/ `suggestion_status`（建议应用追踪，含 `finding_id` + project_id/mr_iid/file_path/line_start/severity）
   - 通过 `src/db/repository.py`（SQLAlchemy async + aiomysql）访问
   - 支持 Step Checkpoint：每个 Agent 完成后立即写库，重跑时可跳过已完成的 Agent
+  - **注意**：MySQL 8.0 不支持 `ADD COLUMN IF NOT EXISTS`（MariaDB 专属语法）。`init_tables()` 的 ALTER TABLE 异常处理只忽略 errno 1060（Duplicate column）和 1061（Duplicate key），其他错误记 warning
 - **Redis**：
-  - 幂等 key：`review:{project_id}:{mr_iid}:{commit_sha}`，TTL 24h；`/ai review` 命令用 `cmd:{timestamp}` 后缀绕过幂等
+  - 检视幂等 key：`review:{project_id}:{mr_iid}:{commit_sha}`，TTL 24h；`/ai review` 命令用 `cmd:{timestamp}` 后缀绕过幂等
+  - explain 幂等 key：`explain:{project_id}:{mr_iid}:{note_id}`，TTL 24h，防止同一评论重复触发解释
   - MR 分布式锁：`review:lock:{project_id}:{mr_iid}`，TTL 1h，SET NX + Lua 安全释放
   - 全局信号量：`review:semaphore:active`，Lua 原子 INCR/DECR，TTL 1h
 - **ES**：`team-norms`（子块向量 + parent_id）+ `parent_doc`（父块原文）
@@ -128,7 +153,7 @@ SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAc
 - `post_inline_comment` 的 `position` 对象（`head_sha` / `new_path` / `new_line`）必须来自当次 `get_pr_diff` 返回，publish_node 负责提前获取
 - synthesize_node 去重逻辑：同 Agent 同行 → 保留最高 severity；不同 Agent 同行 → 全部保留（业界标准：各自独立 inline comment）；跨 Agent 描述前 40 字相同 → 去重
 - critic_node 过滤标准：`_nearest_added_line` 验证行号在 diff `+` 行上；`_description_plausible` 验证关键词与实际代码一致
-- publish_node 跨轮去重键：`(file, line_start, description[:40])` 三元组，不是 `(file, line_start)` 双元组（同行不同描述应各自发评论）
+- publish_node 跨轮去重键：`(file, line_start)` 二元组（同一文件同一行只发一次评论，不同描述也去重）
 - 单个专家 Agent 失败不中断整体流程，SummaryAgent 的 `focus_points` 中追加警告，`review_results.status` 记为 `failed`
 - Webhook 必须验证 `X-Gitcode-Token` header，值来自 `.env` 的 `WEBHOOK_SECRET`
 - LLM 路由规则：模型名 `deepseek-*` 走 DeepSeek API（`DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`），其余走 DashScope

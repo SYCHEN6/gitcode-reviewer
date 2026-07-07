@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS suggestion_status (
     comment_id   BIGINT,
     file_path    VARCHAR(500),
     line_start   INT,
+    severity     VARCHAR(20)  DEFAULT 'LOW',
     status       VARCHAR(20)  NOT NULL DEFAULT 'pending',
     applied_at   DATETIME,
     UNIQUE KEY   uq_finding (finding_id),
@@ -101,13 +102,16 @@ CREATE TABLE IF NOT EXISTS suggestion_status (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-# 旧版本升级：为已有表补充缺失列（幂等，MySQL 8.0+ 支持 IF NOT EXISTS）
+# 旧版本升级：为已有表补充缺失列（幂等）
+# 注意：MySQL 8.0 不支持 ADD COLUMN IF NOT EXISTS，需在 init_tables 中捕获 1060 错误
 _ALTER_SUGGESTION_STATUS = [
-    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS project_id VARCHAR(255)",
-    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS mr_iid INT",
-    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS comment_id BIGINT",
-    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS file_path VARCHAR(500)",
-    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS line_start INT",
+    "ALTER TABLE suggestion_status ADD COLUMN project_id VARCHAR(255)",
+    "ALTER TABLE suggestion_status ADD COLUMN mr_iid INT",
+    "ALTER TABLE suggestion_status ADD COLUMN comment_id BIGINT",
+    "ALTER TABLE suggestion_status ADD COLUMN file_path VARCHAR(500)",
+    "ALTER TABLE suggestion_status ADD COLUMN line_start INT",
+    "ALTER TABLE suggestion_status ADD COLUMN severity VARCHAR(20) DEFAULT 'LOW'",
+    "ALTER TABLE suggestion_status ADD INDEX idx_project_mr (project_id, mr_iid)",
 ]
 
 
@@ -120,8 +124,14 @@ async def init_tables() -> None:
         for alter in _ALTER_SUGGESTION_STATUS:
             try:
                 await conn.execute(text(alter))
-            except Exception:
-                pass  # 列已存在或 MySQL 版本不支持 IF NOT EXISTS，忽略
+            except Exception as e:
+                msg = str(e)
+                # 1060 = Duplicate column name（列已存在）
+                # 1061 = Duplicate key name（索引已存在）
+                if "Duplicate column" in msg or "Duplicate key" in msg:
+                    pass
+                else:
+                    logger.warning("ALTER TABLE skipped: %s", msg)
     logger.info("DB tables initialized (or already exist)")
 
 
@@ -280,6 +290,7 @@ async def save_suggestion(
     comment_id: int,
     file_path: str,
     line_start: int,
+    severity: str = "LOW",
 ) -> None:
     """记录一条已发布的 suggestion（状态=pending）。"""
     _get_engine()
@@ -289,8 +300,8 @@ async def save_suggestion(
         await session.execute(
             text(
                 "INSERT IGNORE INTO suggestion_status "
-                "(task_id, finding_id, project_id, mr_iid, comment_id, file_path, line_start, status) "
-                "VALUES (:tid, :fid, :pid, :mr, :cid, :fp, :ln, 'pending')"
+                "(task_id, finding_id, project_id, mr_iid, comment_id, file_path, line_start, severity, status) "
+                "VALUES (:tid, :fid, :pid, :mr, :cid, :fp, :ln, :sev, 'pending')"
             ),
             {
                 "tid": task_id,
@@ -300,6 +311,7 @@ async def save_suggestion(
                 "cid": comment_id,
                 "fp":  file_path,
                 "ln":  line_start,
+                "sev": severity,
             },
         )
         await session.commit()
@@ -333,3 +345,52 @@ async def mark_suggestions_applied(project_id: str, file_paths: list[str]) -> in
         )
         await session.commit()
         return result.rowcount
+
+
+async def get_open_mr_ids(project_id: str, file_paths: list[str]) -> list[int]:
+    """获取指定文件路径下存在 pending suggestion 的所有 mr_iid（去重）。
+
+    在 mark_suggestions_applied 之前调用，用于确定哪些 MR 需要重算风险标签。
+    """
+    if not file_paths:
+        return []
+    _get_engine()
+    assert _SessionLocal is not None
+
+    placeholders = ", ".join(f":fp{i}" for i in range(len(file_paths)))
+    params: dict = {"pid": project_id}
+    for i, fp in enumerate(file_paths):
+        params[f"fp{i}"] = fp
+
+    async with _SessionLocal() as session:
+        result = await session.execute(
+            text(
+                f"SELECT DISTINCT mr_iid FROM suggestion_status "
+                f"WHERE project_id=:pid AND status='pending' "
+                f"AND file_path IN ({placeholders})"
+            ),
+            params,
+        )
+        rows = result.fetchall()
+    return [int(row[0]) for row in rows if row[0] is not None]
+
+
+async def count_open_critical_high(project_id: str, mr_iid: int) -> int:
+    """统计指定 MR 中仍为 pending 状态的 CRITICAL/HIGH severity suggestion 数量。
+
+    suggestion apply 后触发，用于重算 ai-risk 标签。
+    """
+    _get_engine()
+    assert _SessionLocal is not None
+
+    async with _SessionLocal() as session:
+        result = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM suggestion_status "
+                "WHERE project_id=:pid AND mr_iid=:mr "
+                "AND status='pending' AND severity IN ('CRITICAL', 'HIGH')"
+            ),
+            {"pid": project_id, "mr": mr_iid},
+        )
+        row = result.fetchone()
+    return int(row[0]) if row else 0

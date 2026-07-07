@@ -339,11 +339,32 @@ async def handle_push(payload: dict, background_tasks: BackgroundTasks) -> None:
 async def _mark_suggestions_applied(project_id: str, file_paths: list[str]) -> None:
     try:
         from src.db import repository
+
+        # 先查出哪些 MR 有 pending suggestion 涉及这批文件（apply 前查，apply 后这些行已不是 pending）
+        mr_ids = await repository.get_open_mr_ids(project_id, file_paths)
+
         updated = await repository.mark_suggestions_applied(project_id, file_paths)
         if updated:
             logger.info(
                 "suggestion_status: marked %d suggestion(s) as applied for %s",
                 updated, project_id,
             )
+
+        # apply 后重算各 MR 的风险标签
+        if mr_ids:
+            from src.tools.gitcode_client import GitCodeClient
+            from src.config import settings
+            gc = GitCodeClient(settings.GITCODE_BASE_URL, settings.GITCODE_TOKEN)
+            for mr_iid in mr_ids:
+                try:
+                    open_high = await repository.count_open_critical_high(project_id, mr_iid)
+                    label = "ai-risk-high" if open_high > 0 else "ai-risk-low"
+                    await gc.update_mr_label(project_id, mr_iid, [label])
+                    logger.info(
+                        "Risk label recalculated: %s mr=%s → %s (open_critical_high=%d)",
+                        project_id, mr_iid, label, open_high,
+                    )
+                except Exception as e:
+                    logger.warning("Risk label recalc failed for mr=%s: %s", mr_iid, e)
     except Exception as e:
         logger.debug("mark_suggestions_applied skipped (DB unavailable): %s", e)

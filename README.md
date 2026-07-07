@@ -34,7 +34,8 @@
 |------|------|
 | `/ai review` | 对当前 MR 重新进行完整检视 |
 | `/ai summary` | 仅生成变更摘要，不重新检视 |
-| `/ai explain` | 解释指定代码片段或评论 |
+| `/ai explain <file>:<line>[-<end>]` | 解释指定文件的代码行，如 `/ai explain src/foo.py:42-60` |
+| `/ai explain` + 代码块 | 直接粘贴代码片段请求解释，AI 解释结果追加到同一条评论 |
 | `/ai help` | 显示所有可用命令 |
 
 ## 技术栈
@@ -49,7 +50,7 @@
 | 关系数据库 | MySQL |
 | 缓存 / 去重 | Redis |
 | 工具协议 | MCP（自建 GitCode MCP Server） |
-| GitCode 交互 | python-gitlab |
+| GitCode 交互 | httpx（GitCodeClient 自研封装，GitCode v5 REST API） |
 
 ## 快速开始
 
@@ -154,7 +155,7 @@ gitcode-reviewer/
 │   ├── ARCHITECTURE.md          # 详细架构设计
 │   └── ROADMAP.md               # 开发路线图
 ├── tests/
-│   ├── test_review_logic.py     # 核心逻辑 54 个测试
+│   ├── test_review_logic.py     # 核心逻辑 42 个单元测试
 │   ├── test_concurrency_and_db.py  # 并发控制 + DB 20 个测试
 │   ├── test_gitcode_client.py   # GitCode API 客户端测试
 │   └── test_webhook.py          # Webhook 入口测试

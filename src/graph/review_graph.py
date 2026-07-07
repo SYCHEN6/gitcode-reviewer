@@ -1003,6 +1003,7 @@ async def run_agents_node(state: ReviewState) -> dict:
 
         files = task.get("files", [])
         new_files = _detect_new_files(diffs, set(files) & reviewable_names)
+        token_stats: dict = {}  # run_expert_agent 将 token 消耗写回此 dict
         full_task = {
             **task,
             "project_id":  project_id,
@@ -1011,6 +1012,7 @@ async def run_agents_node(state: ReviewState) -> dict:
             "new_files":   new_files,
             "languages":   languages,
             "_file_cache": file_cache,   # 共享缓存，减少重复 HTTP 请求
+            "_token_stats": token_stats, # token 统计输出 dict
         }
 
         start_ms = int(asyncio.get_event_loop().time() * 1000)
@@ -1037,6 +1039,8 @@ async def run_agents_node(state: ReviewState) -> dict:
                 from src.db.repository import save_agent_result
                 await save_agent_result(
                     task_id, agent_type, findings,
+                    tokens_in=token_stats.get("tokens_in", 0),
+                    tokens_out=token_stats.get("tokens_out", 0),
                     duration_ms=duration_ms,
                     status=agent_status,
                 )
@@ -1154,12 +1158,6 @@ def synthesize_node(state: ReviewState) -> dict:
             unique.append(f)
 
     final = sorted(unique, key=lambda f: _severity_order(f.get("severity", "LOW")))
-
-    # 为每条 finding 分配稳定的 UUID，供 suggestion_status 追踪
-    for f in final:
-        if not f.get("finding_id"):
-            f["finding_id"] = uuid.uuid4().hex
-
     return {"final_findings": final}
 
 
@@ -1292,6 +1290,7 @@ async def publish_node(state: ReviewState) -> dict:
                         await _repo.save_suggestion(
                             task_id, finding_id, project_id, mr_iid,
                             comment_id, fname, line_start,
+                            severity=severity,
                         )
                     except Exception as _db_exc:
                         logger.debug("save_suggestion skipped: %s", _db_exc)

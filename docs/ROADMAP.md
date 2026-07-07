@@ -35,11 +35,11 @@
   - `_enforce_tier_rules()` — Quality/Performance per-file 拆批，large/xl 限批大小
   - `synthesize_node` — 业界标准去重（同 Agent 保留最高 severity，不同 Agent 各自保留）
   - `critic_node` — 行号有效性 + 内容合理性双重过滤
-  - `publish_node` — 跨轮去重（三元组 key）+ 结构化摘要更新
+  - `publish_node` — 跨轮去重（(file, line_start) 二元组 key）+ 结构化摘要更新
   - Redis 分布式并发控制（per-MR 锁 + 全局信号量，支持多实例）
 - [x] `src/agents/supervisor.py` — Supervisor Agent
   - LLM 驱动的追查决策（后续轮）
-  - 首轮改为规则引擎 + LLM Advisor（get_focus_hints）
+  - `get_focus_hints` — 首轮 LLM Advisor，仅生成 focus_hint（不做派发决策）
 - [x] `src/agents/expert_agent.py` — ReAct 循环公共实现
   - 并发预取所有 hunk 上下文 + 新增文件目录列表
   - 多语言检视指引动态注入
@@ -50,7 +50,7 @@
   - 各专项 prompt（多语言通用规则 + 语言无关描述）
   - 统一使用 deepseek-v4-pro 模型
 - [x] `src/agents/summary_agent.py` — SummaryAgent（单次 LLM 调用）
-- [x] `tests/test_review_logic.py` — 32 个核心逻辑单元测试（全部通过）
+- [x] `tests/test_review_logic.py` — 42 个核心逻辑单元测试（全部通过）
 
 **验收：** ✅ 一次 MR 触发 → 多条 inline comment + suggestion block + AI 摘要评论 + 风险标签
 
@@ -71,16 +71,20 @@
 - [x] Checkpoint 集成到 run_review_graph / run_agents_node
 - [x] Suggestion 应用状态追踪（push Webhook 监听）
   - `handle_push` 检测 "Apply * suggestion" commit，提取变更文件 → `mark_suggestions_applied`
-  - `synthesize_node` 为每条 final finding 分配 `finding_id`（UUID hex）
+  - `_parse_findings` 在 `expert_agent.py` 中为每条 finding 分配 `finding_id`（`str(uuid.uuid4())`，带连字符格式）
   - `publish_node` 发布 suggestion 评论后写入 `suggestion_status`（status=pending）
 - [x] `src/agents/explain_agent.py` — ExplainAgent（单次 LLM，解释指定代码行）
 - [x] 命令系统完整实现（`src/webhook/handlers.py`）
   - `/ai review` — 强制重触发完整检视
   - `/ai summary` — 仅生成 PR 摘要（`run_summary_only`，不运行专家 Agent）
-  - `/ai explain <file>:<line>[-<end>]` — 解释指定代码片段，结果发布为 MR 评论
+  - `/ai explain <file>:<line>[-<end>]` — 解释指定代码片段，结果**追加到原始评论**（edit-in-place，非新评论）
+  - `/ai explain` + 代码块 — 直接粘贴代码片段请求解释，AI 解释结果同样追加到原始评论
+  - Redis 幂等保护：`explain:{project_id}:{mr_iid}:{note_id}` TTL 24h，防止 Webhook 重复投递
+  - `_EXPLAIN_MARKER` HTML 注释防止 Webhook 重复触发（marker 已存在则跳过）
+  - `get_pr_comment()` / `update_pr_comment()` 封装 GitCode v5 单条评论读写接口
   - `/ai help` — 发布命令帮助文档
 
-**验收：** ✅ 命令系统全部可用，suggestion 追踪落库，52 个单元测试通过
+**验收：** ✅ 命令系统全部可用，suggestion 追踪落库，/ai explain 追加到原始评论，74 个单元测试通过
 
 ---
 
@@ -122,7 +126,7 @@
 
 **待实现：**
 - [x] **Step Checkpoint 集成**（Phase 3 中实现）：将 repository.py 接入 run_agents_node，跳过已完成 Agent
-- [x] **规则引擎派发**（`_rule_engine_dispatch`）+ LLM Advisor（`get_focus_hints`）分离
+- [x] **规则引擎派发**（`_rule_engine_dispatch`，定义于 `review_graph.py`）+ LLM Advisor（`get_focus_hints`，定义于 `supervisor.py`）分离
   - 首轮：规则引擎确定性派遣（0 LLM 成本）+ LLM Advisor 只生成 focus_hints（成本降低 80%+）
   - 后续轮：完整 LLM Supervisor 动态追查
 - [x] **结构化 Metrics**：每次检视后写入 Redis（key: `review:metrics:{project}:{mr}:{sha8}`，TTL 7天）
@@ -148,7 +152,7 @@
 - [x] 单元测试补充（分布式锁逻辑 / 规则引擎 / DB repository）
   - `tests/test_concurrency_and_db.py`：20 个测试，覆盖 MR 锁 / 全局信号量 / repository CRUD / per-project 配置
   - 全套 74 个测试全部通过
-- [ ] README 完善（含效果截图 + 快速开始）
+- [x] README 完善（Docker 快速开始 + per-project 配置说明 + 项目结构树）
 
 ---
 
@@ -158,6 +162,6 @@
 |------|--------|------|
 | Phase 1 基础链路 | P0 | ✅ 完成 |
 | Phase 2 多 Agent | P0 | ✅ 完成 |
-| Phase 3 持久化+命令 | P1 | 进行中 |
-| Phase 4 RAG | P1 | 待开始 |
-| Phase 5 Harness Engine 优化 | P2 | 部分完成 |
+| Phase 3 持久化+命令 | P1 | ✅ 完成 |
+| Phase 4 RAG | P1 | ✅ 完成 |
+| Phase 5 Harness Engine 优化 | P2 | ✅ 完成 |
