@@ -9,6 +9,11 @@ import asyncio
 import logging
 
 import redis.asyncio as aioredis
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -46,17 +51,21 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     event_type = payload.get("object_kind")
+    logger.info("Webhook received: event_type=%s", event_type)
     redis = _get_redis()
 
     if event_type == "merge_request":
         action = payload.get("object_attributes", {}).get("action", "")
+        logger.info("merge_request action=%s", action)
         if action in ("open", "update", "reopen"):
             await handle_merge_request(payload, background_tasks, redis)
+        else:
+            logger.info("merge_request action=%r ignored", action)
     elif event_type == "note":
         await handle_note(payload, background_tasks, redis)
     elif event_type == "push":
         await handle_push(payload, background_tasks)
     else:
-        logger.info("Ignored unknown event type: %s", event_type)
+        logger.warning("Unknown event_type=%r, full keys: %s", event_type, list(payload.keys()))
 
     return JSONResponse({"status": "accepted"}, status_code=202)

@@ -32,26 +32,29 @@
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │               Supervisor 动态循环（Multi-Agent 核心）      │   │
 │  │                                                          │   │
-│  │  ┌───────────────────────────────────────────────────┐  │   │
-│  │  │  Supervisor Agent（每轮完整 LLM 推理）              │  │   │
-│  │  │  读取：完整 State 含历史 findings + 已执行轮次      │◀─┐│   │
-│  │  │  输出：SupervisorDecision（DISPATCH / FINISH）     │  ││   │
-│  │  └────────────────────┬──────────────────────────────┘  ││   │
-│  │                       │                                  ││   │
-│  │           ┌───────────┴───────────┐                     ││   │
-│  │      DISPATCH                  FINISH                   ││   │
-│  │           ▼                       ▼                     ││   │
-│  │  按本轮决策并行召唤 Agent      退出循环                   ││   │
-│  │  ┌──────────┬──────────┬──────────────┐                 ││   │
-│  │  ▼          ▼          ▼              ▼                  ││   │
-│  │ Security  Logic     Quality      Performance             ││   │
-│  │  Agent    Agent      Agent         Agent                 ││   │
-│  │ (ReAct)  (ReAct)   (ReAct)       (ReAct)                ││   │
-│  │  自主决定  含focus_  含RAG查询     自主决定               ││   │
-│  │  查哪些文件 hint上下文 团队规范     查哪些文件             ││   │
-│  │  ┌──────────┴──────────┴──────────────┘                 ││   │
-│  │  │  findings 汇入 State（operator.add 自动聚合）          │┘   │
-│  │  └──────────────────────────────────────────────────────┘    │
+│  │  【首轮】规则引擎 + LLM 双层决策                           │   │
+│  │  ┌──────────────────────────────────────────────────┐   │   │
+│  │  │ _rule_engine_dispatch(files, languages, tier)    │   │   │
+│  │  │ → 确定性派发（Security/Logic/Quality/Performance）│   │   │
+│  │  │ + get_focus_hints() LLM → focus_hint per agent  │   │   │
+│  │  └──────────────────┬───────────────────────────────┘   │   │
+│  │                     │                                    │   │
+│  │  【后续轮】Supervisor LLM 全权追查                        │   │
+│  │  ┌──────────────────────────────────────────────────┐   │   │
+│  │  │ Supervisor（读 findings）→ DISPATCH / FINISH     │◀──┐│   │
+│  │  └──────────────────┬───────────────────────────────┘   ││   │
+│  │         ┌───────────┴───────────┐                       ││   │
+│  │    DISPATCH                  FINISH                     ││   │
+│  │         ▼                       ▼                       ││   │
+│  │  并行召唤 Agent             退出循环                      ││   │
+│  │  ┌────────┬────────┬────────┬────────┐                  ││   │
+│  │  ▼        ▼        ▼        ▼        │                  ││   │
+│  │ Security Logic  Quality Performance  │                  ││   │
+│  │  Agent   Agent   Agent    Agent      │                  ││   │
+│  │ (ReAct) (ReAct) (ReAct)  (ReAct)    │                  ││   │
+│  │  ┌──────────────────────────────────┘                  ││   │
+│  │  │ findings 汇入 State（operator.add 聚合）              │┘   │
+│  │  └───────────────────────────────────────────────────────┘   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                       │ FINISH                                   │
 │                       ▼                                         │
@@ -59,11 +62,11 @@
 │              │  Summary Agent  │  单次 LLM 调用                  │
 │              └────────┬────────┘                                │
 │                       ▼                                         │
-│             synthesize_node  去重 + severity 排序                │
+│  synthesize_node  去重（per-agent 最高 severity + 描述去重）      │
 │                       ▼                                         │
-│               critic_node   建议质量评估（Reflection）            │
+│    critic_node   行号验证 + 内容合理性过滤（Reflection）          │
 │                       ▼                                         │
-│              publish_node   统一写回 GitCode                     │
+│     publish_node  统一写回 GitCode（跨轮去重 + 结构化摘要）       │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -72,6 +75,7 @@
 │  读取工具（专家 Agent ReAct 循环调用）                            │
 │  ├── get_pr_diff(project_id, mr_iid)                            │
 │  ├── get_file_content(project_id, path, ref)                    │
+│  ├── list_directory(project_id, dir_path, ref)                  │
 │  └── search_team_norms(query)                                   │
 │                                                                 │
 │  写入工具（仅 publish_node 调用）                                 │
@@ -81,14 +85,14 @@
 │  └── update_mr_label(project_id, mr_iid, labels)               │
 └─────────────────────────────────────────────────────────────────┘
 
-┌──────────────────┐  ┌──────────────┐  ┌──────────────────────┐
-│      MySQL       │  │    Redis     │  │   Elasticsearch      │
-│                  │  │              │  │                      │
-│  review_tasks    │  │ 幂等去重锁    │  │ 团队规范向量索引       │
-│  review_results  │  │ 进行中状态   │  │ 历史 PR 知识库        │
-│  suggestion_     │  │              │  │ （混合检索 RAG）      │
-│    status        │  │              │  │                      │
-└──────────────────┘  └──────────────┘  └──────────────────────┘
+┌──────────────────┐  ┌──────────────────────────┐  ┌────────────────────┐
+│      MySQL       │  │          Redis            │  │  Elasticsearch     │
+│                  │  │                          │  │                    │
+│  review_tasks    │  │ 幂等 key（TTL 24h）       │  │ 团队规范向量索引    │
+│  review_results  │  │ MR 分布式锁（TTL 1h）     │  │ 历史 PR 知识库     │
+│  suggestion_     │  │ 全局信号量（TTL 1h）      │  │ （混合检索 RAG）   │
+│    status        │  │                          │  │                    │
+└──────────────────┘  └──────────────────────────┘  └────────────────────┘
 ```
 
 ---
@@ -99,7 +103,8 @@
 
 ### Supervisor 输出 Schema（每轮动态决策）
 
-> Supervisor 每轮读取完整 State（含历史 findings），输出本轮决策。不是一次性全量计划。
+> **首轮**：`supervisor_node` 通过规则引擎生成 `agents_to_dispatch`，调用 LLM 仅补充 `focus_hint`。
+> **后续轮**：Supervisor LLM 完整输出此 Schema，控制 DISPATCH/FINISH 决策。
 
 ```json
 {
@@ -115,7 +120,7 @@
     },
     "reasoning": {
       "type": "string",
-      "description": "本轮决策依据，基于当前 findings 的推理过程，记录在 State 中供审计"
+      "description": "本轮决策依据，记录在 State 中供审计"
     },
     "agents_to_dispatch": {
       "type": "array",
@@ -135,39 +140,32 @@
           },
           "focus_hint": {
             "type": "string",
-            "description": "基于上一轮 findings 的专项提示，如'追查 auth/login.py 第45行的数据流'，首轮为空"
+            "description": "基于上一轮 findings 的专项提示，首轮由 LLM Advisor 生成"
           }
         }
-      }
-    },
-    "pr_meta": {
-      "type": "object",
-      "description": "仅首轮输出，后续轮次复用",
-      "properties": {
-        "total_files":       { "type": "integer" },
-        "total_lines":       { "type": "integer" },
-        "sensitive_modules": { "type": "array", "items": { "type": "string" } }
       }
     }
   }
 }
 ```
 
-### 专家 Agent 任务输入 Schema（Supervisor → 各 Agent）
+### 专家 Agent 任务输入 Schema（supervisor_node → 各 Agent）
 
 ```json
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "AgentTask",
   "type": "object",
-  "required": ["task_id", "agent_type", "project_id", "mr_iid", "file_chunk", "diff_slice"],
+  "required": ["agent_type", "project_id", "mr_iid", "files", "diff_slice"],
   "properties": {
-    "task_id":     { "type": "string", "description": "全局唯一任务 ID" },
     "agent_type":  { "type": "string", "enum": ["SecurityAgent","LogicAgent","QualityAgent","PerformanceAgent"] },
-    "project_id":  { "type": "string", "description": "owner/repo 格式，如 chensiyu47/repo" },
+    "project_id":  { "type": "string", "description": "owner/repo 格式" },
     "mr_iid":      { "type": "integer" },
-    "file_chunk":  { "type": "array", "items": { "type": "string" }, "description": "本 Agent 负责的文件列表" },
-    "diff_slice":  { "type": "string", "description": "对应文件的 diff 片段" }
+    "files":       { "type": "array", "items": { "type": "string" }, "description": "Agent 负责的文件列表" },
+    "diff_slice":  { "type": "string", "description": "对应文件的 diff 片段（由 run_agents_node 填充）" },
+    "focus_hint":  { "type": "string", "description": "Supervisor 给出的专项调查提示" },
+    "new_files":   { "type": "array", "items": { "type": "string" }, "description": "本批次中新增文件（status=added），需预取目录结构" },
+    "languages":   { "type": "array", "items": { "type": "string" }, "description": "PR 变更文件检测到的编程语言列表" }
   }
 }
 ```
@@ -179,51 +177,19 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Finding",
   "type": "object",
-  "required": ["finding_id", "agent", "severity", "category", "file", "line_start", "description", "suggestion_code"],
+  "required": ["finding_id", "agent", "severity", "category", "file", "line_start", "description"],
   "properties": {
     "finding_id":       { "type": "string", "description": "UUID，用于 suggestion_status 追踪" },
     "agent":            { "type": "string", "enum": ["SecurityAgent","LogicAgent","QualityAgent","PerformanceAgent"] },
     "severity":         { "type": "string", "enum": ["CRITICAL","HIGH","MEDIUM","LOW"] },
-    "category": {
-      "type": "string",
-      "enum": ["security", "logic", "quality", "performance"]
-    },
+    "category":         { "type": "string", "enum": ["security", "logic", "quality", "performance"] },
     "file":             { "type": "string" },
-    "line_start":       { "type": "integer", "description": "文件源码行号（展示用）" },
+    "line_start":       { "type": "integer", "description": "新文件行号（diff + 行），不是 context 行" },
     "line_end":         { "type": "integer" },
-    "diff_position":    { "type": "integer", "description": "diff 行偏移量（从 @@ 后第1行算起），作为 post_inline_comment 的 position 参数" },
+    "diff_position":    { "type": "integer", "description": "diff 行偏移量，由 publish_node 计算" },
     "description":      { "type": "string", "description": "问题描述，面向开发者" },
-    "suggestion_code":  { "type": "string", "description": "建议替换的代码内容，用于 suggestion block" },
+    "suggestion_code":  { "type": "string", "description": "建议替换的代码；null=无建议；\"\"=删除该行" },
     "norm_reference":   { "type": "string", "description": "引用的团队规范片段（QualityAgent 专用）" }
-  }
-}
-```
-
-### SummaryAgent 输入 Schema（State → SummaryAgent）
-
-```json
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "SummaryInput",
-  "type": "object",
-  "required": ["pr_meta", "all_findings"],
-  "properties": {
-    "pr_meta":       { "$ref": "#/definitions/PrMeta" },
-    "all_findings": {
-      "type": "array",
-      "items": { "$ref": "Finding" }
-    }
-  },
-  "definitions": {
-    "PrMeta": {
-      "type": "object",
-      "properties": {
-        "total_files":       { "type": "integer" },
-        "total_lines":       { "type": "integer" },
-        "sensitive_modules": { "type": "array", "items": { "type": "string" } },
-        "risk_hint":         { "type": "string" }
-      }
-    }
   }
 }
 ```
@@ -235,54 +201,13 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SummaryOutput",
   "type": "object",
-  "required": ["total_files", "total_lines", "impact_analysis", "risk_level", "focus_points"],
+  "required": ["total_files", "impact_analysis", "risk_level", "focus_points"],
   "properties": {
     "total_files":      { "type": "integer" },
-    "total_lines":      { "type": "integer" },
-    "impact_analysis":  { "type": "string", "description": "改动范围与影响面分析" },
-    "risk_level": {
-      "type": "string",
-      "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    },
-    "risk_reason":   { "type": "string", "description": "风险等级主因说明" },
-    "focus_points": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "主要关注点提示，最多 5 条"
-    }
-  }
-}
-```
-
-### ExplainAgent 输入 / 输出 Schema
-
-```json
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ExplainRequest",
-  "type": "object",
-  "required": ["project_id", "mr_iid", "file_path", "line_number", "parent_comment"],
-  "properties": {
-    "project_id":      { "type": "string", "description": "owner/repo 格式" },
-    "mr_iid":          { "type": "integer" },
-    "file_path":       { "type": "string" },
-    "line_number":     { "type": "integer" },
-    "parent_comment":  { "type": "string", "description": "触发 /ai explain 的父 comment 内容" },
-    "code_context":    { "type": "string", "description": "文件前后 20 行上下文" },
-    "norm_context":    { "type": "string", "description": "ES 查询到的相关团队规范" }
-  }
-}
-```
-
-```json
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ExplainResponse",
-  "type": "object",
-  "required": ["explanation", "reply_to_comment_id"],
-  "properties": {
-    "explanation":          { "type": "string" },
-    "reply_to_comment_id":  { "type": "integer" }
+    "impact_analysis":  { "type": "string" },
+    "risk_level":       { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+    "risk_reason":      { "type": "string" },
+    "focus_points":     { "type": "array", "items": { "type": "string" }, "description": "最多 5 条" }
   }
 }
 ```
@@ -295,90 +220,108 @@
 from typing import TypedDict, Annotated
 import operator
 
-class Finding(TypedDict):
-    finding_id:      str   # UUID
-    agent:           str   # SecurityAgent / LogicAgent / ...
-    severity:        str   # CRITICAL / HIGH / MEDIUM / LOW
-    category:        str   # security / logic / quality / performance
-    file:            str
-    line_start:      int   # 文件源码行号（展示用）
-    line_end:        int
-    diff_position:   int   # diff 行偏移量，post_inline_comment 的 position 参数
-    description:     str
-    suggestion_code: str
-    norm_reference:  str   # QualityAgent 引用的团队规范片段
-
-class SummaryOutput(TypedDict):
-    total_files:     int
-    total_lines:     int
-    impact_analysis: str
-    risk_level:      str   # LOW / MEDIUM / HIGH / CRITICAL
-    risk_reason:     str
-    focus_points:    list[str]
-
 class ReviewState(TypedDict):
-    # 输入
+    # ── 输入 ──────────────────────────────────────────────────────
     project_id:  str   # "owner/repo" 格式
     mr_iid:      int
     commit_sha:  str
-    raw_diff:    str
-    file_list:   list[str]
 
-    # Supervisor 动态循环控制
-    iteration:            int        # 当前轮次，防止无限循环（max=5）
-    supervisor_reasoning: Annotated[list[str], operator.add]  # 每轮决策推理，追加记录
-    pr_meta:              dict       # 首轮填入，后续轮次只读
+    # ── init 阶段填充 ─────────────────────────────────────────────
+    raw_diff:   str
+    file_list:  list[str]
+    diffs:      list[dict]     # 原始 diff 结构（含 status/patch 等）
+    head_sha:   str
+    base_sha:   str
+    pr_stats:   dict           # {files, lines_added, lines_removed, tier}
+    languages:  list[str]      # 从文件扩展名检测出的编程语言列表
+    task_id:    int            # MySQL review_tasks.id（DB 可用时填充）
 
-    # 专家 Agent 输出（跨轮次、跨 Agent 自动聚合）
-    findings: Annotated[list[Finding], operator.add]
+    # ── Supervisor 循环控制 ───────────────────────────────────────
+    iteration:            int
+    supervisor_action:    str  # DISPATCH / FINISH
+    supervisor_reasoning: Annotated[list[str], operator.add]
+    pr_meta:              dict
+    agents_to_dispatch:   list[dict]
 
-    # Summary / 最终
-    summary:        SummaryOutput
-    final_findings: list[Finding]  # synthesize_node 去重排序后
+    # ── 专家 Agent 聚合输出 ───────────────────────────────────────
+    findings: Annotated[list[dict], operator.add]
+
+    # ── 最终输出 ──────────────────────────────────────────────────
+    summary:        dict   # SummaryOutput
+    final_findings: list[dict]
 ```
 
 ---
 
-## 大 PR 处理：Map-Reduce 策略
+## 规则引擎派发逻辑（首轮）
 
-纯 ReAct 在大 PR（50+ 文件，1000+ 行 diff）下会导致 context 爆炸，采用 Map-Reduce：
+`_rule_engine_dispatch(files, languages, tier, pr_stats)` 基于以下规则确定最小 Agent 集合：
 
-```
-整个 diff
-    ↓
-Supervisor 按文件分块（每块 ≤ 10 文件）
-    ↓
-每块 × 每个选中 Agent → 并行 ReAct（每个 ReAct session context 可控）
-[块1×Security] [块1×Logic] [块2×Security] [块2×Logic] ...
-    ↓
-所有 findings 汇入 State（operator.add 自动聚合）
-    ↓
-SummaryAgent 单次 LLM 调用（接收聚合后的 findings，不做 ReAct）
-    ↓
-synthesize_node 去重 + 排序
-    ↓
-publish_node 统一写回
-```
+| 触发条件 | 必含 Agent |
+|---------|-----------|
+| 路径含 auth/login/token/password/crypto/jwt/oauth | SecurityAgent |
+| 语言含 SQL | SecurityAgent |
+| 路径含 train/inference/model/layer/attn/flash/cuda/gpu | PerformanceAgent |
+| 语言含 C++/Rust/C | PerformanceAgent |
+| tier = large / xl | PerformanceAgent |
+| 所有情况 | QualityAgent + LogicAgent |
+| tier = medium / large / xl | 所有 4 个 Agent |
 
-**分块规则（Supervisor 执行）：**
-- 默认每块 ≤ 10 个文件
-- 敏感文件（auth / payment / db 路径）单独成块，优先处理
-- 纯文档 / 注释变更文件跳过专家 Agent，直接进 SummaryAgent
+`_enforce_tier_rules` 在派发决策之后做结构性纠正：
+- QualityAgent / PerformanceAgent：超过 1 个文件则按文件拆批（保证每文件独立覆盖）
+- large / xl tier：所有 Agent 每批最多 5 个文件
 
-**ReAct 轮次限制：** 每个专家 Agent session `max_iterations = 8`，超出强制结束并标记 `truncated: true`。
+---
 
-**Agent 局部失败处理：**
+## 大 PR 处理：文件拆批并行
 
 ```
-某个专家 Agent ReAct session 抛出异常或超时
-  → 捕获异常，该 Agent 输出空 findings（不中断整体流程）
-  → 在 SummaryAgent 的 focus_points 中追加警告：
-    "SecurityAgent 检视异常，建议人工复查安全相关变更"
-  → MySQL review_results 记录该 Agent 的 status = 'failed'
-  → 整体 review_tasks.status 仍为 'done'（部分完成）
+整个 diff（过滤后可检视文件）
+    ↓
+_filter_reviewable_diffs()
+  - 跳过：图片/二进制/lock/生成物（按扩展名+路径）
+  - soft threshold（~640K chars）：记录警告继续
+  - hard threshold（~752K chars）：文件级停止（不截断文件内部）
+    ↓
+_calc_pr_stats() → tier: small / medium / large / xl
+    ↓
+_rule_engine_dispatch() → base Agent 集合
+    ↓
+_enforce_tier_rules() → 文件拆批（Quality/Performance per-file，large/xl 每批≤5文件）
+    ↓
+asyncio.gather(*[run_agent(task) for task in tasks])
+  每个 Agent session：
+    - 并发预取所有 hunk 上下文 + 新增文件目录列表
+    - ReAct 循环（max_iterations=8）
+    - Token 消耗逐次累计，完成时输出 [agent] tokens(in=X out=Y total=Z)
+    ↓
+findings 通过 operator.add 聚合到 State
 ```
 
-**规则：单个 Agent 失败不影响其他 Agent 和最终发布，但在摘要中透明告知用户。**
+---
+
+## 并发控制（分布式，支持多实例）
+
+```
+Webhook 触发
+  ↓
+Redis 幂等检查：review:{project_id}:{mr_iid}:{commit_sha}
+  存在 → skip（同 commit 不重复检视）
+  不存在 → setex(key, 24h)
+  ↓
+BackgroundTasks.add_task(run_review_graph, ...)
+  ↓
+run_review_graph 内部：
+  ① 获取 per-MR 分布式锁：review:lock:{project_id}:{mr_iid}
+     SET NX PX 3600000（1h TTL 兜底）
+     等待 120s，超时后 warning + 继续
+  ② 获取全局分布式信号量：review:semaphore:active
+     Lua 原子 INCR + 检查 ≤ MAX_CONCURRENT_REVIEWS
+     等待 60s，超时后 warning + 继续
+  ③ 执行 _graph.ainvoke(initial)
+  ④ 释放信号量（DECR）
+  ⑤ 释放 MR 锁（Lua：仅当 owner 匹配时 DEL）
+```
 
 ---
 
@@ -390,276 +333,133 @@ publish_node 统一写回
 - `POST /webhook` — 接收所有 GitCode Webhook 事件（需验证 Secret Token）
 - `GET /health` — 健康检查
 
-**Webhook Secret 验证：**
-```python
-# 验证 X-Gitcode-Token header，防止伪造请求（GitCode 发送的是 X-Gitcode-Token，非 X-Gitlab-Token）
-if request.headers.get("X-Gitcode-Token") != settings.WEBHOOK_SECRET:
-    raise HTTPException(status_code=401)
-```
-
 **幂等保障：**
 
 | 触发来源 | Redis Key | 行为 |
 |---------|-----------|------|
 | MR 自动触发 | `review:{project_id}:{mr_iid}:{commit_sha}` | 存在则跳过，防止同一 commit 重复检视 |
-| `/ai review` 命令 | `review:{project_id}:{mr_iid}:cmd:{timestamp}` | 每次命令生成新 key，**始终执行**，不受自动触发的锁影响 |
-| `/ai summary` 命令 | 不加锁 | SummaryAgent 单次调用，幂等本身开销低 |
+| `/ai review` 命令 | `review:{project_id}:{mr_iid}:cmd:{timestamp}` | 每次命令生成新 key，始终执行 |
 
 ---
 
-### 2. Supervisor Agent（`src/agents/supervisor.py`）
+### 2. Supervisor 层（`src/agents/supervisor.py`）
 
-**模式：** 动态循环，每轮 LLM 推理（非 ReAct，无工具调用，但多轮执行）
+**职责分离：**
 
-**输入（每轮）：** 完整 ReviewState，包含：
-- 首轮：raw_diff + file_list（无历史 findings）
-- 后续轮：raw_diff + file_list + 历史 findings + supervisor_reasoning
+| 函数 | 调用时机 | 职责 |
+|------|---------|------|
+| `_rule_engine_dispatch()` | 首轮，在 `supervisor_node` 内 | 确定性派发，不调 LLM |
+| `get_focus_hints()` | 首轮，配合规则引擎 | 仅生成 focus_hint，单次 LLM 调用 |
+| `run_supervisor()` | 后续轮（iteration≥1） | 完整 DISPATCH/FINISH 决策，LLM 读取 findings |
 
-**输出（每轮）：** `SupervisorDecision`（JSON Schema 见上）
-
-**循环终止条件（满足任一即输出 FINISH）：**
-- LLM 判断当前 findings 已覆盖所有文件和风险点
-- `iteration >= 5`（硬性上限，防止无限循环）
-- 本轮 `agents_to_dispatch` 为空（无新任务）
-
-**决策示例（体现 Multi-Agent 动态性）：**
-```
-第1轮：分析 diff，发现涉及 auth + db，
-       → DISPATCH [SecurityAgent(全部文件), LogicAgent(全部文件),
-                   QualityAgent(全部文件), PerformanceAgent(全部文件)]
-第2轮：读取 findings，SecurityAgent 发现 auth/login.py:45 有 SQL 注入，
-       → DISPATCH [LogicAgent(files=["auth/login.py"],
-                              focus_hint="追查第45行参数传递路径")]
-第3轮：追查 findings 充分，无新风险点，
-       → FINISH
-```
+**决策规则（首轮规则引擎）：**
+- 文件路径含安全相关词 → SecurityAgent
+- 文件路径含 ML/系统性能词 / 语言含 C++/Rust → PerformanceAgent
+- tier=medium+ → 全量 4 Agent
+- 始终包含：QualityAgent + LogicAgent
 
 ---
 
-### 3. 专家 Agent 设计
+### 3. 专家 Agent 设计（`src/agents/expert_agent.py`）
 
-所有专家 Agent 使用 ReAct 模式，**只调用读取工具，不写 GitCode**。
+所有专家 Agent 基于 `run_expert_agent()` 实现，具备：
 
-| Agent | 文件 | 检测范围 | 可用工具 |
-|-------|------|---------|---------|
-| SecurityAgent | `security_agent.py` | SQL注入、硬编码密钥、明文密码、不安全随机数 | `get_file_content` |
-| LogicAgent | `logic_agent.py` | 空指针、资源泄露、竞态条件、整数溢出 | `get_file_content` |
-| QualityAgent | `quality_agent.py` | 过长函数、重复代码、命名不规范 | `get_file_content`, `search_team_norms` |
-| PerformanceAgent | `performance_agent.py` | N+1 查询、不必要循环、内存浪费 | `get_file_content` |
+- **ReAct 循环**（最多 8 轮）：`get_file_content` 工具调用 → 推理 → 输出
+- **并发预取**：`asyncio.gather` 同时拉取所有 hunk 上下文 + 新增文件目录列表
+- **Token 追踪**：每次 `llm.ainvoke()` 后累计 `usage_metadata`，完成时记录
+  ```
+  [QualityAgent] done: iter=3 findings=4 tokens(in=28450 out=1230 total=29680)
+  ```
+- **重试策略（tenacity）**：HTTP 429/5xx/网络错误 → 指数退避重试（max 3次）；4xx/解析错误 → 不重试直接降级
+- **多语言注入**：从 `task.languages` 动态生成语言检视指引，注入 `initial_msg`
+- **新增文件上下文**：为 `task.new_files` 预取目录列表，帮助发现命名冲突
 
-**每个 Agent 输出：** `list[Finding]`（JSON Schema 见上）
+| Agent | 文件 | 检测范围 | 模型 |
+|-------|------|---------|------|
+| SecurityAgent | `security_agent.py` | SQL注入、硬编码密钥、明文密码 | deepseek-v4-pro |
+| LogicAgent | `logic_agent.py` | 空指针、资源泄露、竞态、边界条件 | deepseek-v4-pro |
+| QualityAgent | `quality_agent.py` | 过长函数、重复代码、魔法数字、调试残留 | deepseek-v4-pro |
+| PerformanceAgent | `performance_agent.py` | N+1、内存、同步I/O、ML热路径 | deepseek-v4-pro |
 
----
-
-### 4. SummaryAgent（`src/agents/summary_agent.py`）
-
-**模式：** 单次 LLM 调用（不使用 ReAct，不调工具）
-
-**输入：** `SummaryInput`（所有 findings + pr_meta）
-**输出：** `SummaryOutput`
-
-**风险评级权重：**
-
-| 维度 | 权重 | 高风险信号 |
-|------|------|-----------|
-| 安全 / 逻辑发现 | 40% | CRITICAL / HIGH finding 数量 |
-| 改动范围 | 30% | 文件数 > 10 或核心模块变更 |
-| 测试覆盖 | 20% | 改动函数无对应测试新增 |
-| 历史热点 | 10% | Supervisor 标记的敏感模块 |
+Supervisor 使用 qwen（DashScope）。
 
 ---
 
-### 5. ExplainAgent（`src/agents/explain_agent.py`）
+### 4. synthesize_node（去重逻辑）
 
-**模式：** 轻量 ReAct（固定 2 步：get_file_content → search_team_norms → 生成解释）
+对所有 Agent findings 执行：
 
-**触发：** 用户在任意 inline comment 下回复 `/ai explain`
-
-**输入来源：**
-- `note.position.new_path` → file_path
-- `note.position.new_line` → line_number
-- 父 comment body → parent_comment
+1. **同 Agent 同行去重**：`key=(agent, file, line_start)` → 保留最高 severity 那条
+2. **跨 Agent 同行保留**：不同 Agent 发现同一行 → 全部保留（业界标准，各自独立 comment）
+3. **描述去重**：`key=(file, line_start, description[:40])` → 跨 Agent 相同描述只保留一条
+4. **排序**：CRITICAL → HIGH → MEDIUM → LOW
 
 ---
 
-### 6. synthesize_node
+### 5. critic_node（质量过滤）
 
-对 `state.findings` 执行：
-1. **去重**：按 `(file, line_start, category)` 组合键去重，不用 `finding_id`（同一问题在不同 chunk 中会产生不同 UUID，但文件 + 行号 + 类别相同）；保留 severity 最高的那条
-2. **排序**：CRITICAL → HIGH → MEDIUM → LOW
-3. 写入 `state.final_findings`
+逐条 finding 执行以下验证，任意不通过则丢弃：
 
----
-
-### 7. publish_node
-
-遍历 `state.final_findings`，调用 MCP 写入工具：
-- 每条 finding → `post_inline_comment`（含问题描述）
-- finding 有 `suggestion_code` → 追加 `post_suggestion`
-- 写入 `suggestion_status` 表（记录 comment_id + finding_id + severity）
-- 完成后调用 `update_mr_description`（写入 summary）
-- 调用 `update_mr_label`（写入风险等级 label）
+1. **行号有效性**：`_nearest_added_line(patch, line_start)` → 必须是 diff 中的 `+` 行
+2. **内容合理性**：`_description_plausible(description, code_range)` → description 声称存在的关键词（如 `print`）必须在实际代码区间内出现
 
 ---
 
-### 8. GitCode MCP Server（`src/mcp/gitcode_server.py`）
+### 6. publish_node（跨轮去重 + 写回）
 
-封装 GitCode v5 REST API（GitHub/Gitee 风格，非 GitLab v4 兼容），暴露为 MCP 工具。
-
-- API 基础路径：`{base_url}/api/v5/repos/{owner}/{repo}/...`
-- `project_id` 全局使用 `"owner/repo"` 字符串（如 `"chensiyu47/MindIE-SD_1344"`），不是整数
-
-**传输协议：Streamable HTTP**（MCP 2025 规范推荐，双向流，替代旧版 SSE）
-- MCP Server 作为独立 FastAPI 应用运行，端口 8081
-- Agent 通过 `POST /mcp` 端点发起工具调用请求
-- 相比 SSE 支持双向通信，适合生产级部署
-
-**Suggestion Block 格式：**
-````
-```suggestion
-替换后的代码内容
-```
-````
-
-**MCP 工具 Input/Output Schema：**
-
-```json
-// get_pr_diff
-{
-  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer" },
-  "output": {
-    "diff":      "string  ← 拼接后的 unified diff 文本",
-    "files":     ["string"],
-    "diffs":     [{}],
-    "head_sha":  "string  ← inline comment 的 commit_id",
-    "base_sha":  "string",
-    "start_sha": "string  ← 等同 base_sha（GitCode v5 无独立 start_sha）"
-  }
-}
-
-// get_file_content
-{
-  "input":  { "project_id": "string (owner/repo)", "file_path": "string", "ref": "string" },
-  "output": { "content": "string" }
-}
-
-// search_team_norms
-{
-  "input":  { "query": "string", "top_k": "integer (default: 3)" },
-  "output": {
-    "results": [
-      { "content": "string", "source": "string", "score": "number" }
-    ]
-  }
-}
-
-// post_inline_comment（GitCode v5 风格 position）
-{
-  "input": {
-    "project_id": "string (owner/repo)",
-    "mr_iid":     "integer",
-    "body":       "string",
-    "position": {
-      "head_sha":  "string  ← 来自 get_pr_diff.head_sha，作为 commit_id",
-      "new_path":  "string  ← 文件路径",
-      "new_line":  "integer ← diff 中的行偏移量（Finding.diff_position）"
-    }
-  },
-  "output": { "comment_id": "integer" }
-}
-
-// post_suggestion（body 内嵌 suggestion block）
-{
-  "input": {
-    "project_id":      "string (owner/repo)",
-    "mr_iid":          "integer",
-    "suggestion_code": "string",
-    "position":        "同 post_inline_comment.position"
-  },
-  "output": { "comment_id": "integer" }
-}
-
-// update_mr_description
-{
-  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer", "body": "string" },
-  "output": { "success": "boolean" }
-}
-
-// update_mr_label（labels 必须是仓库已有标签名，不可为空数组）
-{
-  "input":  { "project_id": "string (owner/repo)", "mr_iid": "integer", "labels": ["string"] },
-  "output": { "success": "boolean" }
-}
-```
-
-> **说明：** `post_inline_comment` 的 `position.new_line` 是 **diff 行偏移量**（从 `@@` 行后第 1 行算起的计数），不是文件行号。publish_node 在调用前须先通过 `get_pr_diff` 拿到 `head_sha`，并从 diff 文本计算每条 Finding 对应的 `diff_position`（Finding Schema 新增字段）。
+1. 拉取 PR 现有评论，通过 `_parse_reported_keys()` 提取已报告的三元组：`(file, line_start, description[:40])`
+2. 只对新发现（三元组不在已报告集合中）发布 inline comment
+3. 发布格式：`{emoji} **[{SEVERITY}]** \`{file}:{line}\`\n\n{description}`，有建议时附 suggestion block
+4. 更新/创建 AI 摘要评论（含问题清单 + 风险等级 + 统计）
+5. 设置 `ai-risk:high` / `ai-risk:low` 标签
 
 ---
 
-### 9. RAG 知识库（Elasticsearch）
+### 7. 数据库持久化（`src/db/repository.py`）
 
-**索引结构：**
-- `team-norms` 索引：团队 Coding Guideline 文档切片（稠密向量 + BM25 混合检索）
-- `pr-history` 索引：历史已合并高质量 PR diff 片段（后续扩展）
+**异步访问**：SQLAlchemy async engine + aiomysql 驱动
+**连接字符串**：自动将 `mysql+pymysql://` 转换为 `mysql+aiomysql://`
 
-**`search_team_norms(query)` 实现：** ES 混合检索，返回 top-3 相关父块内容，拼入 QualityAgent 的 prompt context。
+**Step Checkpoint 流程**：
+1. `run_review_graph` 入口：`create_or_get_task()` → 获取 `task_id`（支持同 commit 续跑）
+2. `run_agents_node` 执行前：`load_agent_findings(task_id)` → 跳过已完成的 Agent
+3. 每个 Agent 完成后：`save_agent_result()` → 立即持久化（含 findings JSON + token 统计）
+4. `publish_node` 完成后：`complete_task(task_id)`
 
 ---
 
-### 10. 知识库初始化（`src/tools/ingest_norms.py`）
+### 8. GitCode Client（`src/tools/gitcode_client.py`）
 
-**触发方式：** 命令行工具，文件路径作为参数
+封装 GitCode v5 REST API（`/api/v5/repos/{owner}/{repo}/...`），主要接口：
 
-```bash
-python -m src.tools.ingest_norms --path ./docs/coding_standards.md
-python -m src.tools.ingest_norms --path ./docs/java_guidelines.pdf
-```
+| 方法 | 用途 |
+|------|------|
+| `get_pr_diff` | 获取 PR diff + SHA 信息 |
+| `get_file_content` | 获取文件内容（支持 ref） |
+| `list_directory` | 获取目录文件列表（新增文件上下文感知） |
+| `post_inline_comment` | 发送行内评论 |
+| `post_suggestion` | 发送代码建议 block |
+| `get_pr_comments` | 获取现有评论（跨轮去重用） |
+| `update_pr_comment` | 更新 AI 摘要评论 |
+| `update_mr_label` | 设置风险等级标签 |
 
-**分块策略：父子分块（Parent-Child Chunking）**
+---
 
-参考 know-engine 实现，父子分块在检索精度和上下文完整性之间取得平衡：
+### 9. 多语言支持
 
-```
-原始文档
-    ↓ 切分
-父块（Parent Chunk）：段落级，500~1000 tokens
-  ├── 子块1（Child Chunk）：句子级，100~200 tokens  ← 向量化、用于检索
-  ├── 子块2（Child Chunk）
-  └── 子块3（Child Chunk）
+**语言检测**：`_detect_languages(diffs)` 从文件扩展名检测，覆盖 35+ 种语言：
 
-检索时：
-  用户 query → 向量搜索匹配子块 → 返回子块对应的父块内容
-  （子块精准定位，父块保证上下文完整）
-```
+| 语言族 | 扩展名 |
+|--------|--------|
+| Python 生态 | .py .pyi .pyx |
+| JVM | .java .kt .scala .groovy |
+| Go | .go |
+| Web 前端 | .js .ts .tsx .jsx .vue .svelte |
+| 系统语言 | .c .cpp .cc .h .hpp .rs .swift |
+| 脚本 | .rb .php .sh .lua .dart |
+| 数据/配置 | .sql .proto .tf .yaml .toml |
 
-**处理流程：**
-
-```
-1. 读取文件（支持 .md / .txt / .pdf）
-2. 按段落切分为父块（ParentTextSplitter，chunk_size=800）
-3. 每个父块再切分为子块（ChildTextSplitter，chunk_size=150，overlap=20）
-4. 子块向量化（DashScope Embedding）
-5. ES 写入：
-   - parent_doc 索引：存储父块原文 + metadata（source, section）
-   - team-norms 索引：存储子块向量 + parent_id 外键
-6. 输出入库统计（父块数 / 子块数 / 耗时）
-```
-
-**ES 索引 Mapping（team-norms）：**
-
-```json
-{
-  "mappings": {
-    "properties": {
-      "parent_id":  { "type": "keyword" },
-      "content":    { "type": "text", "analyzer": "ik_max_word" },
-      "embedding":  { "type": "dense_vector", "dims": 1536 },
-      "source":     { "type": "keyword" },
-      "chunk_index":{ "type": "integer" }
-    }
-  }
-}
-```
+**注入方式**：检测结果以语言检视指引注入每个 Agent 的 `initial_msg`，LLM 自动应用对应语言的最佳实践。
 
 ---
 
@@ -669,56 +469,62 @@ python -m src.tools.ingest_norms --path ./docs/java_guidelines.pdf
 
 ```sql
 CREATE TABLE review_tasks (
-    id           BIGINT PRIMARY KEY AUTO_INCREMENT,
-    project_id   VARCHAR(200) NOT NULL COMMENT 'owner/repo 格式，如 chensiyu47/repo',
-    mr_iid       INT         NOT NULL,
-    commit_sha   VARCHAR(40) NOT NULL,
-    status       ENUM('pending','running','done','failed') DEFAULT 'pending',
-    triggered_by VARCHAR(20) COMMENT 'auto / command',
-    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uk_project_mr_commit (project_id, mr_iid, commit_sha),
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    project_id  VARCHAR(200) NOT NULL COMMENT 'owner/repo 格式',
+    mr_iid      INT NOT NULL,
+    commit_sha  VARCHAR(64) NOT NULL,
+    status      ENUM('running','completed','failed') NOT NULL DEFAULT 'running',
+    tier        VARCHAR(20) COMMENT 'small/medium/large/xl',
+    languages   JSON COMMENT '检测到的编程语言列表',
+    total_files INT DEFAULT 0,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_review (project_id(191), mr_iid, commit_sha(64)),
     INDEX idx_status (status)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### review_results
 
 ```sql
 CREATE TABLE review_results (
-    id         BIGINT PRIMARY KEY AUTO_INCREMENT,
-    task_id    BIGINT      NOT NULL,
-    agent      VARCHAR(50) NOT NULL COMMENT 'SecurityAgent / LogicAgent / ...',
-    status     ENUM('done','failed') DEFAULT 'done',
-    findings   JSON        COMMENT '符合 Finding Schema 的数组，failed 时为 null',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_task (task_id)
-);
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id     BIGINT NOT NULL,
+    agent_type  VARCHAR(50) NOT NULL COMMENT 'SecurityAgent / LogicAgent / ...',
+    status      ENUM('completed','failed','skipped') NOT NULL DEFAULT 'completed',
+    findings    JSON COMMENT '符合 Finding Schema 的数组',
+    tokens_in   INT DEFAULT 0,
+    tokens_out  INT DEFAULT 0,
+    duration_ms INT DEFAULT 0,
+    error_msg   VARCHAR(500),
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_task_agent (task_id, agent_type(50)),
+    FOREIGN KEY (task_id) REFERENCES review_tasks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### suggestion_status
 
 ```sql
 CREATE TABLE suggestion_status (
-    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
-    task_id     BIGINT       NOT NULL,
-    finding_id  VARCHAR(36)  NOT NULL COMMENT 'Finding.finding_id UUID',
-    comment_id  BIGINT       NOT NULL COMMENT 'GitCode 写回的 comment ID',
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id     BIGINT NOT NULL,
+    finding_id  VARCHAR(36) NOT NULL COMMENT 'Finding.finding_id UUID',
+    comment_id  BIGINT NOT NULL COMMENT 'GitCode 写回的 comment ID',
     file_path   VARCHAR(500) NOT NULL,
-    line_number INT          NOT NULL,
+    line_number INT NOT NULL,
     severity    ENUM('CRITICAL','HIGH','MEDIUM','LOW') NOT NULL,
     status      ENUM('open','applied','dismissed') DEFAULT 'open',
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_task_file (task_id, file_path),
-    INDEX idx_finding  (finding_id)
-);
+    INDEX idx_finding (finding_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-**风险等级 label 重算逻辑（suggestion apply 后触发）：**
-
+**风险等级重算逻辑（suggestion apply 后触发）：**
 ```
 查询 task_id 关联的所有 suggestion_status
-  → 统计 severity IN ('CRITICAL','HIGH') AND status = 'open' 的数量 N
+  → 统计 severity IN ('CRITICAL','HIGH') AND status='open' 的数量 N
   → N == 0 : update_mr_label(['ai-risk:low'])
   → N  > 0 : update_mr_label(['ai-risk:high'])
 ```
@@ -730,59 +536,37 @@ CREATE TABLE suggestion_status (
 ### MR 自动检视流程
 
 ```
-1.  GitCode 推送 merge_request Webhook（header: X-Gitcode-Event / X-Gitcode-Token）
-2.  验证 X-Gitcode-Token
-3.  Redis 幂等检查：key review:{project_id}:{mr_iid}:{commit_sha} 存在 → 跳过
-4.  MySQL 写入 review_tasks（status=pending）
-5.  启动 LangGraph ReviewOrchestrator（异步，FastAPI 立即返回 202）
-6.  supervisor_node：单次 LLM 调用，输出 SupervisorDecision（JSON）
-7.  Map 阶段：按 file_chunks × selected_agents 展开并行任务
-    每个 Agent session 独立 ReAct，max_iterations=8
-    输出 list[Finding]，通过 operator.add 聚合到 state.findings
-8.  summary_node：单次 LLM 调用，输出 SummaryOutput（JSON）
-9.  synthesize_node：去重 + severity 排序 → state.final_findings
-10. publish_node：遍历 final_findings，调 MCP 写入工具
-    - post_inline_comment（每条 finding）
-    - post_suggestion（有 suggestion_code 的 finding）
-    - 写 suggestion_status 表
-    - update_mr_description（摘要）
-    - update_mr_label（风险等级）
-11. MySQL 更新 review_tasks（status=done）
+1.  GitCode → merge_request Webhook（X-Gitcode-Token 验证）
+2.  Redis 幂等检查（project_id = path_with_namespace）
+3.  获取 per-MR 分布式锁（review:lock:{project_id}:{mr_iid}）
+4.  获取全局信号量（review:semaphore:active ≤ MAX_CONCURRENT_REVIEWS）
+5.  MySQL review_tasks 创建/获取（支持断点续跑）
+6.  get_pr_diff → 过滤不可检视文件 → 检测编程语言
+7.  【首轮】规则引擎确定 Agent 集合 + LLM Advisor 生成 focus_hint
+8.  _enforce_tier_rules 文件拆批（Quality/Performance per-file）
+9.  asyncio.gather 并行执行所有 Agent（ReAct 循环，max 8 次）
+    - 并发预取 hunk 上下文 + 新增文件目录列表
+    - Token 追踪（usage_metadata 累计）
+    - tenacity 重试（429/5xx 指数退避，最多 3 次）
+    - 每个 Agent 完成后写 review_results
+10. findings 通过 operator.add 聚合到 State
+11. 【可选第 2 轮追查】Supervisor LLM 读 findings → DISPATCH 追查 / FINISH
+12. synthesize_node 去重排序 → critic_node 质量过滤
+13. summary_node 生成检视摘要（SummaryOutput JSON）
+14. publish_node：
+    - 跨轮去重（拉现有评论，三元组比对）
+    - 发布 inline comment + suggestion block
+    - 更新/创建 AI 摘要评论
+    - 设置风险标签
+15. MySQL 更新 review_tasks.status = 'completed'
+16. 释放分布式锁和信号量
 ```
 
 ### Suggestion Apply 处理流程
 
 ```
-1.  GitCode 推送 push Webhook
-2.  遍历 commits[].message，匹配正则 r"Apply \d* ?suggestion"
-3.  取 commits[].modified 文件路径列表
-4.  查 suggestion_status WHERE file_path IN (...) AND status='open'
-5.  更新匹配记录 status='applied'
-6.  重算风险等级 → update_mr_label
-```
-
-### /ai summary 流程
-
-```
-1.  接收 note Webhook，body.strip() == "/ai summary"
-2.  调用 get_pr_diff 获取 diff 基础信息（文件数、行数）
-3.  查询 MySQL review_results 取该 MR 最近一次检视的 findings
-    → 若无历史 findings，直接基于 diff 生成（无问题数据）
-4.  SummaryAgent 单次 LLM 调用，输出 SummaryOutput（JSON）
-5.  post_inline_comment 将摘要回复到 /ai summary 所在 comment thread
-    （不更新 MR 描述，不修改 label）
-```
-
-### /ai explain 流程
-
-```
-1.  接收 note Webhook，body.strip() == "/ai explain"
-2.  从 note.position 提取 file_path + line_number
-3.  从父 note body 提取 parent_comment
-4.  构建 ExplainRequest（JSON Schema）
-5.  ExplainAgent 轻量 ReAct：
-    step1: get_file_content(file_path) → 取前后 20 行
-    step2: search_team_norms(parent_comment) → 取 top-3 规范片段
-    step3: LLM 综合生成 ExplainResponse（JSON）
-6.  post_inline_comment 回复到原 thread
+1.  push Webhook → 匹配 commit msg r"Apply \d* ?suggestion"
+2.  查 suggestion_status WHERE file_path IN (...) AND status='open'
+3.  更新 status='applied'
+4.  重算风险等级 → update_mr_label
 ```

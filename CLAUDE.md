@@ -42,19 +42,51 @@ GitCode Webhook → FastAPI (src/webhook/main.py)
 
 ### Multi-Agent 核心：Supervisor 动态循环
 
-**不是 Plan-and-Execute**。Supervisor 每轮读取完整 State（含历史 findings）后用 LLM 动态决策，输出 `DISPATCH`（继续）或 `FINISH`（结束）。
+**不是 Plan-and-Execute**。Supervisor 采用**规则引擎 + LLM 双层决策**模式，首轮通过确定性规则引擎决定派哪些 Agent，后续轮次 LLM 基于完整 findings 动态追查。
 
 ```
-Supervisor（每轮 LLM 推理，最多 5 轮）
-  ↓ DISPATCH：按本轮决策并行召唤 Agent
-  SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAct，max 8 轮）
+【首轮】
+_rule_engine_dispatch(files, languages, tier)  ← 确定性，不依赖 LLM
+  ↓ 确定最小 Agent 集合（按路径/语言/规模判断）
+  + get_focus_hints(...)  ← LLM 仅生成 focus_hint，不控制派发
+  ↓ DISPATCH → 并行召唤 Agent（附 hint）
+
+【后续轮】
+Supervisor LLM（读取完整 findings + 历史推理）
+  ↓ DISPATCH：追查发现的新风险点（精确 focus_hint）
+  ↓ FINISH：调查充分，退出循环
+
+SecurityAgent / LogicAgent / QualityAgent / PerformanceAgent（各自独立 ReAct，max 8 轮）
   ↓ findings 通过 operator.add 聚合到 State
   ↓ 回到 Supervisor 再次推理
   ↓ FINISH
   SummaryAgent（单次 LLM 调用）→ synthesize_node → critic_node → publish_node
 ```
 
-`focus_hint` 字段是 Agent 协作的关键：Supervisor 根据上一轮某 Agent 的发现，给下一轮指定 Agent 传递精确的调查方向。
+**首轮使用规则引擎的原因**：LLM 决策在边界情况下输出格式不稳定，规则引擎保证 Agent 集合的确定性。`focus_hint` 仍由 LLM 生成，保留语义理解能力。`_enforce_tier_rules` 在 Supervisor 决策之后做结构性纠正（per-file 拆批、文件数限制）。
+
+### 并发控制（Redis 分布式）
+
+系统支持多项目并发 Webhook、多实例横向扩展，通过双层 Redis 分布式机制保证安全：
+
+| 层级 | Redis Key | 机制 | 作用 |
+|------|-----------|------|------|
+| per-MR 锁 | `review:lock:{project_id}:{mr_iid}` | SET NX + Lua 安全释放 | 同一 MR 多次 push 串行执行，防止并发刷评论 |
+| 全局信号量 | `review:semaphore:active` | Lua 原子 INCR+检查 | 跨实例限制总并发数（默认 10，`MAX_CONCURRENT_REVIEWS` 配置） |
+
+两者均有 TTL 兜底（进程崩溃不永久锁死），超时后降级为 warning + 继续执行。
+
+### 多语言支持
+
+`_detect_languages(diffs)` 从变更文件扩展名自动识别编程语言（覆盖 Python / Go / Java / TypeScript / C++ / Rust / SQL 等 35+ 种），结果注入：
+- `ReviewState.languages`（供 Supervisor 参考）
+- 每个 Agent 的 `initial_msg`（动态语言检视指引）
+
+### 新增文件目录上下文
+
+当 diff 包含新增文件（`status=added`），系统自动：
+1. 调用 `GitCodeClient.list_directory()` 获取目标目录现有文件列表
+2. 将目录结构注入 Agent 上下文，帮助发现命名冲突、功能重复实现等问题
 
 ### 工具分层（严格隔离）
 
@@ -82,13 +114,21 @@ Supervisor（每轮 LLM 推理，最多 5 轮）
 
 ## 数据持久化
 
-- **MySQL**：`review_tasks`（任务状态）/ `review_results`（Agent 级输出）/ `suggestion_status`（建议应用追踪，含 `finding_id` 外键）
-- **Redis**：幂等 key `review:{project_id}:{mr_iid}:{commit_sha}`，TTL 24h；`/ai review` 命令用 `cmd:{timestamp}` 后缀绕过幂等
+- **MySQL**：`review_tasks`（任务状态 + tier/languages）/ `review_results`（Agent 级输出，含 tokens_in/out/duration_ms）/ `suggestion_status`（建议应用追踪，含 `finding_id` 外键）
+  - 通过 `src/db/repository.py`（SQLAlchemy async + aiomysql）访问
+  - 支持 Step Checkpoint：每个 Agent 完成后立即写库，重跑时可跳过已完成的 Agent
+- **Redis**：
+  - 幂等 key：`review:{project_id}:{mr_iid}:{commit_sha}`，TTL 24h；`/ai review` 命令用 `cmd:{timestamp}` 后缀绕过幂等
+  - MR 分布式锁：`review:lock:{project_id}:{mr_iid}`，TTL 1h，SET NX + Lua 安全释放
+  - 全局信号量：`review:semaphore:active`，Lua 原子 INCR/DECR，TTL 1h
 - **ES**：`team-norms`（子块向量 + parent_id）+ `parent_doc`（父块原文）
 
 ## 关键约束
 
-- `post_inline_comment` 的 `position` 对象（`base_sha` / `start_sha` / `head_sha`）必须来自当次 `get_pr_diff` 返回，publish_node 负责提前获取
-- synthesize_node 去重键是 `(file, line_start, category)`，不是 `finding_id`（同一问题在不同 chunk 有不同 UUID）
+- `post_inline_comment` 的 `position` 对象（`head_sha` / `new_path` / `new_line`）必须来自当次 `get_pr_diff` 返回，publish_node 负责提前获取
+- synthesize_node 去重逻辑：同 Agent 同行 → 保留最高 severity；不同 Agent 同行 → 全部保留（业界标准：各自独立 inline comment）；跨 Agent 描述前 40 字相同 → 去重
+- critic_node 过滤标准：`_nearest_added_line` 验证行号在 diff `+` 行上；`_description_plausible` 验证关键词与实际代码一致
+- publish_node 跨轮去重键：`(file, line_start, description[:40])` 三元组，不是 `(file, line_start)` 双元组（同行不同描述应各自发评论）
 - 单个专家 Agent 失败不中断整体流程，SummaryAgent 的 `focus_points` 中追加警告，`review_results.status` 记为 `failed`
-- Webhook 必须验证 `X-Gitlab-Token` header，值来自 `.env` 的 `WEBHOOK_SECRET`
+- Webhook 必须验证 `X-Gitcode-Token` header，值来自 `.env` 的 `WEBHOOK_SECRET`
+- LLM 路由规则：模型名 `deepseek-*` 走 DeepSeek API（`DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`），其余走 DashScope

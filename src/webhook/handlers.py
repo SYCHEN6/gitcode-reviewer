@@ -45,15 +45,21 @@ async def handle_note(
     redis: aioredis.Redis,
 ) -> None:
     attrs = payload.get("object_attributes", {})
+    noteable_type = attrs.get("noteable_type", "")
+    note_body: str = attrs.get("note", "").strip()
+    logger.info("handle_note: noteable_type=%r note_body=%r", noteable_type, note_body[:80])
+
     # 只处理 MR 上的评论，忽略 Issue 评论
-    if attrs.get("noteable_type") != "MergeRequest":
+    if noteable_type != "MergeRequest":
+        logger.info("handle_note: skip, noteable_type=%r is not MergeRequest", noteable_type)
         return
 
-    note_body: str = attrs.get("note", "").strip()
     project_id = _project_id(payload)
     mr_iid: int = payload.get("merge_request", {}).get("iid", 0)
+    logger.info("handle_note: project=%s mr_iid=%s", project_id, mr_iid)
 
     if not mr_iid:
+        logger.warning("handle_note: mr_iid not found in payload, keys=%s", list(payload.keys()))
         return
 
     if note_body == "/ai review":
@@ -64,7 +70,7 @@ async def handle_note(
         background_tasks.add_task(run_review_graph, project_id, mr_iid, commit_sha)
         logger.info("/ai review triggered for project=%s mr=%s", project_id, mr_iid)
     else:
-        logger.info("Ignored note command: %r", note_body)
+        logger.info("handle_note: not a command, note_body=%r", note_body)
 
 
 async def handle_push(payload: dict, background_tasks: BackgroundTasks) -> None:

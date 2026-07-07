@@ -5,10 +5,13 @@ API 基础路径：{base_url}/api/v5/repos/{owner}/{repo}/...
 """
 
 import base64
+import logging
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # project_id 格式为 "owner/repo"，例如 "chensiyu47/MindIE-SD_1344"
 ProjectID = str
@@ -52,7 +55,7 @@ class GitCodeClient:
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as c:
             r = await c.patch(f"{self._base}{path}", json=body)
             r.raise_for_status()
-            return r.json()
+            return r.json() if r.content else {}
 
     async def _put(self, path: str, body: dict) -> Any:
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as c:
@@ -131,19 +134,24 @@ class GitCodeClient:
         body: str,
         position: dict,
     ) -> dict:
-        """在 PR 指定位置发送 inline comment（GitHub v5 风格）。
+        """在 PR 指定代码行发送 inline comment。
 
         position 字段：
         - head_sha (commit_id): 来自 get_pr_diff 返回值
         - new_path (path): 文件路径
-        - new_line (position): diff 中的行号
+        - new_line: 文件实际行号（新文件 line number，非 diff offset）
         """
         owner, repo = _parse_ns(project_id)
+        line_num = position.get("new_line", 1)
         payload = {
             "body": body,
             "commit_id": position.get("head_sha", position.get("commit_id", "")),
             "path": position.get("new_path", position.get("path", "")),
-            "position": position.get("new_line", position.get("position", 1)),
+            # 优先使用 line（GitHub 新式参数，直接指定文件行号），
+            # 同时保留 position 作为兼容字段（GitCode 可能同时支持两者）
+            "line": line_num,
+            "side": "RIGHT",
+            "position": line_num,
         }
         data = await self._post(
             f"/repos/{owner}/{repo}/pulls/{mr_iid}/comments",
@@ -179,16 +187,106 @@ class GitCodeClient:
         )
         return {"success": True}
 
+    async def get_pr_comments(self, project_id: ProjectID, mr_iid: int) -> list[dict]:
+        """获取 PR 所有评论（inline + 全局），用于去重检测。"""
+        owner, repo = _parse_ns(project_id)
+        data = await self._get(
+            f"/repos/{owner}/{repo}/pulls/{mr_iid}/comments",
+            params={"per_page": 100},
+        )
+        return data if isinstance(data, list) else []
+
+    async def get_pr_info(self, project_id: ProjectID, mr_iid: int) -> dict:
+        """获取 PR 基本信息，含当前 body/description。"""
+        owner, repo = _parse_ns(project_id)
+        return await self._get(f"/repos/{owner}/{repo}/pulls/{mr_iid}")
+
+    async def update_pr_comment(
+        self,
+        project_id: ProjectID,
+        mr_iid: int,
+        comment_id: int,
+        body: str,
+    ) -> dict:
+        """编辑已有 PR 评论内容。
+
+        GitCode v5 的评论编辑接口不含 mr_iid：PATCH /pulls/comments/{id}
+        """
+        owner, repo = _parse_ns(project_id)
+        data = await self._patch(
+            f"/repos/{owner}/{repo}/pulls/comments/{comment_id}",
+            {"body": body},
+        )
+        return {"comment_id": data.get("id", comment_id)}
+
     async def get_repo_labels(self, project_id: ProjectID) -> list[dict]:
         """返回仓库已有的标签列表 [{name, color, ...}]。"""
         owner, repo = _parse_ns(project_id)
         data = await self._get(f"/repos/{owner}/{repo}/labels")
         return data if isinstance(data, list) else []
 
+    async def create_label(self, project_id: ProjectID, name: str, color: str) -> bool:
+        """在仓库创建标签。返回 True 表示标签现在已存在，False 表示 API 拒绝创建。
+
+        Gitee/GitCode v5 API 标签创建接口要求 form 表单参数（不接受 JSON body）。
+        必须从 client-level headers 中剔除 Content-Type，否则 application/json 会
+        覆盖 httpx 为 data= 自动设置的 application/x-www-form-urlencoded，导致
+        Spring @RequestParam 无法解析参数。
+        """
+        owner, repo = _parse_ns(project_id)
+        hex_color = "#" + color.lstrip("#")  # API 要求 # 前缀，如 "#e11d48"
+        # 剔除 Content-Type，让 httpx 按 data= 编码方式自动填充
+        form_headers = {k: v for k, v in self._headers.items() if k.lower() != "content-type"}
+        try:
+            async with httpx.AsyncClient(headers=form_headers, timeout=30) as c:
+                r = await c.post(
+                    f"{self._base}/repos/{owner}/{repo}/labels",
+                    data={"name": name, "color": hex_color},
+                )
+                r.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+            if e.response.status_code in (409, 422):  # 标签已存在
+                return True
+            if e.response.status_code == 400:
+                logger.warning("create_label '%s' rejected by API (400): %s", name, body)
+                return False
+            raise
+
+    async def list_directory(self, project_id: ProjectID, dir_path: str, ref: str) -> list[dict]:
+        """返回指定目录下的文件/目录列表（用于新增文件的上下文感知）。
+
+        GitCode v5 contents 接口对目录路径返回 list，对文件路径返回 dict。
+        每个条目含 name / path / type("file"|"dir") 字段。
+        """
+        owner, repo = _parse_ns(project_id)
+        clean = dir_path.strip("/")
+        encoded = quote(clean, safe="") if clean else ""
+        path = f"/repos/{owner}/{repo}/contents"
+        if encoded:
+            path += f"/{encoded}"
+        try:
+            data = await self._get(path, params={"ref": ref})
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
     async def update_mr_label(self, project_id: ProjectID, mr_iid: int, labels: list[str]) -> dict:
         owner, repo = _parse_ns(project_id)
-        await self._put(
-            f"/repos/{owner}/{repo}/pulls/{mr_iid}/labels",
-            {"labels": labels},
-        )
+        # GitCode v5 PUT labels 接口要求直接发 JSON array，不是 {"labels": [...]}
+        async with httpx.AsyncClient(headers=self._headers, timeout=30) as c:
+            r = await c.put(
+                f"{self._base}/repos/{owner}/{repo}/pulls/{mr_iid}/labels",
+                json=labels,
+            )
+            if not r.is_success:
+                raise httpx.HTTPStatusError(
+                    f"{r.status_code} {r.reason_phrase} — {r.text[:300]}",
+                    request=r.request, response=r,
+                )
         return {"success": True}

@@ -11,24 +11,28 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM = """你是 PR 代码检视摘要专家。根据专家 Agent 的 findings 和 PR 基础信息，
-生成结构化的检视摘要。
+_SYSTEM = """你是 PR 代码检视摘要专家，负责将专家 Agent 的检视结果综合为结构化摘要。
 
-输出严格遵循以下 JSON 格式，不要输出任何其他文字：
+## 评估步骤（Chain of Thought）
+在输出 JSON 前，请按以下步骤推理：
+1. **影响面分析**：这次 PR 修改了哪些模块？是核心业务逻辑（认证/支付/数据存储）还是边缘功能？
+2. **严重性权重**：CRITICAL 问题 × 3 + HIGH 问题 × 2 + MEDIUM 问题 × 1 是多少？
+3. **风险综合判断**：根据严重性权重 + 改动范围 + 是否涉及敏感模块，选择 risk_level：
+   - CRITICAL：有 CRITICAL finding，或认证/支付核心逻辑大改且有 HIGH
+   - HIGH：有 HIGH finding，或 10+ 文件涉及核心模块
+   - MEDIUM：有 MEDIUM finding，或中等规模业务逻辑修改
+   - LOW：仅 LOW finding 或无问题，改动范围小
+4. **关注点提炼**：最需要 reviewer 人工关注的 1-5 个点是什么？
+
+输出严格遵循以下 JSON，不要输出任何其他文字：
 {
   "total_files": 变更文件数（整数）,
   "total_lines": 估算变更行数（整数）,
   "impact_analysis": "改动范围与影响面分析（中文，100字以内）",
   "risk_level": "LOW|MEDIUM|HIGH|CRITICAL",
   "risk_reason": "风险等级主因（中文，50字以内）",
-  "focus_points": ["关注点1", "关注点2"]（最多 5 条）
+  "focus_points": ["关注点1（含文件和行号）", "关注点2"]（最多 5 条，每条 30 字以内）
 }
-
-风险评级参考：
-- CRITICAL：存在 CRITICAL severity findings，或涉及认证/支付核心逻辑大改动
-- HIGH：存在 HIGH findings，或改动范围超过 10 个文件涉及核心模块
-- MEDIUM：存在 MEDIUM findings，或有一定规模的业务逻辑修改
-- LOW：仅有 LOW findings 或无问题，改动范围小
 """
 
 
@@ -57,17 +61,21 @@ async def run_summary_agent(
     else:
         findings_text = "无 findings。"
 
-    user_content = f"""## PR 基础信息
-- 变更文件数：{total_files}
-- 变更行数（估算）：{total_lines}
-- 变更文件：{', '.join(file_list[:20])}{'...' if total_files > 20 else ''}
-
-## Findings 汇总
-严重程度分布：CRITICAL={sev_counts['CRITICAL']} HIGH={sev_counts['HIGH']} MEDIUM={sev_counts['MEDIUM']} LOW={sev_counts['LOW']}
-
-{findings_text}
-
-请输出 SummaryOutput JSON。"""
+    files_str = ", ".join(file_list[:20]) + ("..." if total_files > 20 else "")
+    sev_str = (
+        f"CRITICAL={sev_counts['CRITICAL']} HIGH={sev_counts['HIGH']} "
+        f"MEDIUM={sev_counts['MEDIUM']} LOW={sev_counts['LOW']}"
+    )
+    user_content = (
+        f"## PR 基础信息\n"
+        f"- 变更文件数：{total_files}\n"
+        f"- 变更行数（估算）：{total_lines}\n"
+        f"- 变更文件：{files_str}\n\n"
+        f"## Findings 汇总\n"
+        f"严重程度分布：{sev_str}\n\n"
+        f"{findings_text}\n\n"
+        "请输出 SummaryOutput JSON。"
+    )
 
     llm = ChatOpenAI(
         model=settings.LLM_MODEL,
