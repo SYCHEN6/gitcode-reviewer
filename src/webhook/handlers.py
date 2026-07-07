@@ -12,6 +12,9 @@ from src.graph.review_graph import run_review_graph, run_summary_only
 logger = logging.getLogger(__name__)
 
 _REDIS_TTL = 86400  # 24h
+# 用于标记"AI 解释已追加"的 HTML 注释，防止 webhook 重复触发
+# 选用含随机后缀的字符串，降低 LLM 在输出中自行生成该 marker 的概率
+_EXPLAIN_MARKER = "<!-- __AI_EXPLAIN_APPENDED_7f3a__ -->"
 
 _HELP_TEXT = """\
 ## 🤖 AI Code Reviewer — 可用命令
@@ -87,8 +90,16 @@ async def handle_note(
         background_tasks.add_task(run_summary_only, project_id, mr_iid)
         logger.info("/ai summary triggered for project=%s mr=%s", project_id, mr_iid)
 
-    elif note_body.startswith("/ai explain"):
-        _handle_explain(note_body, project_id, mr_iid, payload, background_tasks)
+    elif note_body.startswith("/ai explain") and _EXPLAIN_MARKER not in note_body:
+        note_id: int = attrs.get("id", 0)
+        # 幂等保护：同一 note_id 只处理一次（防止 webhook 重复投递）
+        if note_id > 0:
+            explain_key = f"explain:{project_id}:{mr_iid}:{note_id}"
+            if await redis.exists(explain_key):
+                logger.info("Skipping duplicate explain: %s", explain_key)
+                return
+            await redis.setex(explain_key, _REDIS_TTL, "running")
+        _handle_explain(note_body, project_id, mr_iid, background_tasks, note_id)
 
     elif note_body == "/ai help":
         background_tasks.add_task(_post_help, project_id, mr_iid)
@@ -102,33 +113,47 @@ def _handle_explain(
     note_body: str,
     project_id: str,
     mr_iid: int,
-    payload: dict,
     background_tasks: BackgroundTasks,
+    note_id: int = 0,
 ) -> None:
-    """解析 /ai explain <file>:<line>[-<end>] 并派发任务。"""
-    # 匹配格式：/ai explain src/foo.py:42  或  /ai explain src/foo.py:42-60
-    m = re.search(r"/ai\s+explain\s+([^\s:]+):(\d+)(?:-(\d+))?", note_body)
-    if not m:
-        logger.warning("/ai explain: 格式错误，期望 /ai explain <file>:<line>[-<end>]，实际=%r", note_body)
+    """解析 /ai explain 命令，支持两种用法：
+
+    1. /ai explain <file>:<line>[-<end>]  — 按文件行号拉取
+    2. /ai explain\\n<code snippet>        — 直接粘贴代码片段
+    """
+    # 提取 /ai explain 后面的内容
+    rest = re.sub(r"^/ai\s+explain\s*", "", note_body, count=1, flags=re.IGNORECASE).strip()
+
+    # 优先尝试 file:line 格式
+    m = re.match(r"^([^\s:]+):(\d+)(?:-(\d+))?$", rest)
+    if m:
+        file_path  = m.group(1)
+        line_start = int(m.group(2))
+        line_end   = int(m.group(3)) if m.group(3) else 0
+        logger.info(
+            "/ai explain [file]: project=%s mr=%s file=%s line=%s-%s",
+            project_id, mr_iid, file_path, line_start, line_end or line_start,
+        )
         background_tasks.add_task(
-            _post_explain_error,
-            project_id, mr_iid,
-            "命令格式错误，请使用：`/ai explain <文件路径>:<行号>` 例如 `/ai explain src/foo.py:42`",
+            _run_explain_and_post,
+            project_id, mr_iid, file_path, line_start, line_end, note_id,
         )
         return
 
-    file_path  = m.group(1)
-    line_start = int(m.group(2))
-    line_end   = int(m.group(3)) if m.group(3) else 0
+    # 剩余内容当做代码片段（去除 Markdown 代码块围栏）
+    snippet = re.sub(r"^```\w*\n?", "", rest)
+    snippet = re.sub(r"\n?```$", "", snippet).strip()
 
-    logger.info(
-        "/ai explain: project=%s mr=%s file=%s line=%s-%s",
-        project_id, mr_iid, file_path, line_start, line_end or line_start,
-    )
-    background_tasks.add_task(
-        _run_explain_and_post,
-        project_id, mr_iid, file_path, line_start, line_end,
-    )
+    if not snippet:
+        background_tasks.add_task(
+            _post_explain_error,
+            project_id, mr_iid,
+            "请在 `/ai explain` 后粘贴需要解释的代码，或使用 `/ai explain <文件路径>:<行号>` 格式。",
+        )
+        return
+
+    logger.info("/ai explain [snippet]: project=%s mr=%s snippet_len=%d", project_id, mr_iid, len(snippet))
+    background_tasks.add_task(_run_explain_snippet_and_post, project_id, mr_iid, snippet, note_id, rest)
 
 
 async def _run_explain_and_post(
@@ -137,8 +162,9 @@ async def _run_explain_and_post(
     file_path: str,
     line_start: int,
     line_end: int,
+    note_id: int = 0,
 ) -> None:
-    """调用 ExplainAgent 并将结果发布为 MR 评论。"""
+    """调用 ExplainAgent 并将结果追加到原始评论（或发布为新评论）。"""
     from src.agents.explain_agent import run_explain_agent
     from src.tools.gitcode_client import GitCodeClient
     from src.config import settings
@@ -162,22 +188,109 @@ async def _run_explain_and_post(
     key_points  = result.get("key_points", [])
     actual_end  = result.get("line_end", line_end or line_start)
 
-    lines = [
+    explain_lines = [
         f"## 💡 代码解释 — `{file_path}:{line_start}`",
         "",
         explanation,
     ]
     if key_points:
-        lines += ["", "**关键点：**"]
-        lines += [f"- {p}" for p in key_points]
-    lines += ["", f"*`{file_path}` 第 {line_start}–{actual_end} 行*"]
+        explain_lines += ["", "**关键点：**"]
+        explain_lines += [f"- {p}" for p in key_points]
+    explain_body = "\n".join(explain_lines).replace(_EXPLAIN_MARKER, "")
 
-    body = "\n".join(lines)
+    # 优先编辑原始评论（追加解释），避免产生两条独立评论
+    if note_id > 0:
+        try:
+            orig = await gc.get_pr_comment(project_id, note_id)
+            orig_body = orig.get("body", "")
+            if _EXPLAIN_MARKER in orig_body:
+                logger.info("explain: marker already present, skipping note_id=%s", note_id)
+                return
+            new_body = f"{orig_body}\n\n{_EXPLAIN_MARKER}\n\n{explain_body}"
+            await gc.update_pr_comment(project_id, mr_iid, note_id, new_body)
+            logger.info("explain appended to original comment: project=%s mr=%s note_id=%s file=%s:%s",
+                        project_id, mr_iid, note_id, file_path, line_start)
+            return
+        except Exception as e:
+            logger.warning("_run_explain_and_post: edit original comment failed, fallback: %s", e)
+
+    # Fallback：发布新评论（带代码位置引用）
+    fallback_lines = [
+        f"**你提问的代码：** `{file_path}` 第 {line_start}–{actual_end} 行",
+        "",
+        "---",
+        "",
+        explain_body,
+    ]
     try:
-        await gc.post_mr_note(project_id, mr_iid, body)
-        logger.info("explain comment posted: project=%s mr=%s file=%s:%s", project_id, mr_iid, file_path, line_start)
+        await gc.post_mr_note(project_id, mr_iid, "\n".join(fallback_lines))
+        logger.info("explain comment posted (fallback): project=%s mr=%s file=%s:%s",
+                    project_id, mr_iid, file_path, line_start)
     except Exception as e:
         logger.error("_run_explain_and_post: post_mr_note failed: %s", e)
+
+
+async def _run_explain_snippet_and_post(
+    project_id: str,
+    mr_iid: int,
+    snippet: str,
+    note_id: int = 0,
+    raw_user_input: str = "",
+) -> None:
+    """调用 ExplainAgent（片段模式）并将结果追加到原始评论（或发布为新评论）。"""
+    from src.agents.explain_agent import run_explain_agent_snippet
+    from src.tools.gitcode_client import GitCodeClient
+    from src.config import settings
+
+    try:
+        result = await run_explain_agent_snippet(snippet)
+    except Exception as e:
+        logger.error("_run_explain_snippet_and_post: explain_agent failed: %s", e)
+        await _post_explain_error(project_id, mr_iid, f"代码解释失败：{e}")
+        return
+
+    explanation = result.get("explanation", "")
+    key_points  = result.get("key_points", [])
+
+    explain_lines = ["## 💡 代码解释", "", explanation]
+    if key_points:
+        explain_lines += ["", "**关键点：**"]
+        explain_lines += [f"- {p}" for p in key_points]
+    explain_body = "\n".join(explain_lines).replace(_EXPLAIN_MARKER, "")
+
+    gc = GitCodeClient(settings.GITCODE_BASE_URL, settings.GITCODE_TOKEN)
+
+    # 优先编辑原始评论（追加解释），避免产生两条独立评论
+    if note_id > 0:
+        try:
+            orig = await gc.get_pr_comment(project_id, note_id)
+            orig_body = orig.get("body", "")
+            # 如果 marker 已存在（并发重入保护），直接跳过
+            if _EXPLAIN_MARKER in orig_body:
+                logger.info("snippet explain: marker already present, skipping note_id=%s", note_id)
+                return
+            new_body = f"{orig_body}\n\n{_EXPLAIN_MARKER}\n\n{explain_body}"
+            await gc.update_pr_comment(project_id, mr_iid, note_id, new_body)
+            logger.info("snippet explain appended to original comment: project=%s mr=%s note_id=%s",
+                        project_id, mr_iid, note_id)
+            return
+        except Exception as e:
+            logger.warning("_run_explain_snippet_and_post: edit original comment failed, fallback: %s", e)
+
+    # Fallback：发布新评论（带代码引用块）
+    display_code = raw_user_input or snippet
+    fallback_lines: list[str] = []
+    if display_code.strip():
+        fallback_lines += ["**你提问的代码：**", ""]
+        fallback_lines += [f"> {ln}" for ln in display_code.splitlines()]
+        fallback_lines += ["", "---", ""]
+    fallback_lines.append(explain_body)
+
+    try:
+        await gc.post_mr_note(project_id, mr_iid, "\n".join(fallback_lines))
+        logger.info("snippet explain comment posted (fallback): project=%s mr=%s", project_id, mr_iid)
+    except Exception as e:
+        logger.error("_run_explain_snippet_and_post: post_mr_note failed: %s", e)
 
 
 async def _post_explain_error(project_id: str, mr_iid: int, message: str) -> None:

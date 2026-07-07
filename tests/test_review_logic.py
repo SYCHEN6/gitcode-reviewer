@@ -107,16 +107,17 @@ AI_COMMENT = (
     "```suggestion\n\n```"
 )
 
-def test_parse_reported_keys_extracts_triple():
+def test_parse_reported_keys_extracts_pair():
     comments = [_make_comment(AI_COMMENT)]
     reported = _parse_reported_keys(comments)
     assert len(reported) == 1
     key = next(iter(reported))
     assert key[0] == "layers/attn.py"
     assert key[1] == 240
-    assert "调试残留" in key[2]
+    assert len(key) == 2  # 跨 run 去重只用 (file, line) 二元组
 
-def test_parse_reported_keys_two_different_findings_same_line():
+def test_parse_reported_keys_two_findings_same_line_deduped():
+    # 同一行两条不同描述 → 跨 run 去重视为同一位置，只记录一次
     comment1 = (
         "🟡 **[MEDIUM]** `file.py:100`\n\n魔法数字：0.9 应提取为常量\n\n```suggestion\n```"
     )
@@ -124,7 +125,7 @@ def test_parse_reported_keys_two_different_findings_same_line():
         "🟡 **[MEDIUM]** `file.py:100`\n\n静默裁剪：无日志输出给用户\n\n```suggestion\n```"
     )
     reported = _parse_reported_keys([_make_comment(comment1), _make_comment(comment2)])
-    assert len(reported) == 2  # 同行不同描述 → 两条独立记录
+    assert len(reported) == 1  # 同行 → 跨 run 只需记一次，防止重复 review 时重复发评论
 
 def test_parse_reported_keys_ignores_non_ai_comment():
     # 人工评论没有 emoji+severity 格式 → 被忽略
@@ -471,10 +472,11 @@ def test_synthesize_finding_id_not_overwritten():
 # ── handlers: 命令解析 ────────────────────────────────────────────────────────
 
 def test_handle_explain_parses_file_line():
-    """_handle_explain 能正确解析 /ai explain src/foo.py:42。"""
+    """_handle_explain 能正确解析 /ai explain src/foo.py:42 → file:line 模式。"""
     import re
     note = "/ai explain src/foo.py:42"
-    m = re.search(r"/ai\s+explain\s+([^\s:]+):(\d+)(?:-(\d+))?", note)
+    rest = re.sub(r"^/ai\s+explain\s*", "", note).strip()
+    m = re.match(r"^([^\s:]+):(\d+)(?:-(\d+))?$", rest)
     assert m is not None
     assert m.group(1) == "src/foo.py"
     assert int(m.group(2)) == 42
@@ -485,10 +487,36 @@ def test_handle_explain_parses_range():
     """_handle_explain 能解析 /ai explain src/foo.py:10-30 的行范围。"""
     import re
     note = "/ai explain src/foo.py:10-30"
-    m = re.search(r"/ai\s+explain\s+([^\s:]+):(\d+)(?:-(\d+))?", note)
+    rest = re.sub(r"^/ai\s+explain\s*", "", note).strip()
+    m = re.match(r"^([^\s:]+):(\d+)(?:-(\d+))?$", rest)
     assert m is not None
     assert int(m.group(2)) == 10
     assert int(m.group(3)) == 30
+
+
+def test_handle_explain_snippet_extracts_code():
+    """/ai explain + 代码片段 → 提取代码，不误判为 file:line。"""
+    import re
+    note = "/ai explain\ndef foo(x):\n    return x * 2"
+    rest = re.sub(r"^/ai\s+explain\s*", "", note, flags=re.IGNORECASE).strip()
+    # 不应匹配 file:line 格式
+    m = re.match(r"^([^\s:]+):(\d+)(?:-(\d+))?$", rest)
+    assert m is None
+    # 应提取到代码片段
+    snippet = re.sub(r"^```\w*\n?", "", rest)
+    snippet = re.sub(r"\n?```$", "", snippet).strip()
+    assert "def foo" in snippet
+
+
+def test_handle_explain_snippet_strips_code_fence():
+    """带 Markdown 代码围栏的片段应剥除围栏标记。"""
+    import re
+    note = "/ai explain\n```python\ndef bar():\n    pass\n```"
+    rest = re.sub(r"^/ai\s+explain\s*", "", note, flags=re.IGNORECASE).strip()
+    snippet = re.sub(r"^```\w*\n?", "", rest)
+    snippet = re.sub(r"\n?```$", "", snippet).strip()
+    assert snippet.startswith("def bar()")
+    assert "```" not in snippet
 
 
 @pytest.mark.asyncio

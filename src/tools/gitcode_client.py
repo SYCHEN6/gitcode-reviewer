@@ -171,13 +171,16 @@ class GitCodeClient:
         return await self.post_inline_comment(project_id, mr_iid, body, position)
 
     async def post_mr_note(self, project_id: ProjectID, mr_iid: int, body: str) -> dict:
-        """发送 PR 全局评论（无 position）。"""
+        """发送 PR 全局评论（无 position）。
+
+        GitCode v5 POST 响应中 id 为 hex 字符串，note_id 为整数 comment ID。
+        """
         owner, repo = _parse_ns(project_id)
         data = await self._post(
             f"/repos/{owner}/{repo}/pulls/{mr_iid}/comments",
             {"body": body},
         )
-        return {"comment_id": data.get("id", 0)}
+        return {"comment_id": data.get("note_id") or data.get("id", 0)}
 
     async def update_mr_description(self, project_id: ProjectID, mr_iid: int, body: str) -> dict:
         owner, repo = _parse_ns(project_id)
@@ -186,6 +189,14 @@ class GitCodeClient:
             {"body": body},
         )
         return {"success": True}
+
+    async def get_pr_comment(self, project_id: ProjectID, comment_id: int) -> dict:
+        """获取单条 PR 评论内容。
+
+        GitCode v5 单条评论接口路径不含 mr_iid：GET /pulls/comments/{id}
+        """
+        owner, repo = _parse_ns(project_id)
+        return await self._get(f"/repos/{owner}/{repo}/pulls/comments/{comment_id}")
 
     async def get_pr_comments(self, project_id: ProjectID, mr_iid: int) -> list[dict]:
         """获取 PR 所有评论（inline + 全局），用于去重检测。"""

@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+  # ── AI Reviewer Webhook 服务 ────────────────────────────────────────────────
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      MYSQL_URL: mysql+aiomysql://reviewer:reviewer@mysql:3306/reviewer
+      REDIS_URL: redis://redis:6379
+      ES_URL: http://elasticsearch:9200
+      MCP_SERVER_HOST: mcp
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./project_configs:/app/project_configs:ro
+
+  # ── GitCode MCP Server ───────────────────────────────────────────────────────
+  mcp:
+    build: .
+    command: python -m src.mcp.gitcode_server
+    ports:
+      - "8081:8081"
+    env_file: .env
+    environment:
+      MCP_SERVER_HOST: "0.0.0.0"
+      MCP_SERVER_PORT: "8081"
+    restart: unless-stopped
+
+  # ── MySQL ────────────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: reviewer
+      MYSQL_USER: reviewer
+      MYSQL_PASSWORD: reviewer
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ureviewerRoot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Elasticsearch ────────────────────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.13.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:
+  es_data:

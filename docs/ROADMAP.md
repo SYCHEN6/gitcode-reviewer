@@ -121,7 +121,7 @@
 - [x] 多语言支持（35+ 种语言检测 + 动态注入）
 
 **待实现：**
-- [ ] **Step Checkpoint 集成**（Phase 3 中实现）：将 repository.py 接入 run_agents_node，跳过已完成 Agent
+- [x] **Step Checkpoint 集成**（Phase 3 中实现）：将 repository.py 接入 run_agents_node，跳过已完成 Agent
 - [x] **规则引擎派发**（`_rule_engine_dispatch`）+ LLM Advisor（`get_focus_hints`）分离
   - 首轮：规则引擎确定性派遣（0 LLM 成本）+ LLM Advisor 只生成 focus_hints（成本降低 80%+）
   - 后续轮：完整 LLM Supervisor 动态追查
@@ -137,9 +137,17 @@
     "timestamp": "2026-06-30T10:00:00"
   }
   ```
-- [ ] **Per-project 配置**：`project_configs/{project_id}.yaml`，支持 per-project Agent 集合 / findings 上限 / severity 阈值
-- [ ] Docker 部署配置（uvicorn + MySQL + Redis + ES 一键启动）
-- [ ] 单元测试补充（分布式锁逻辑 / 规则引擎 / DB repository）
+- [x] **Per-project 配置**：`project_configs/{project_id}.yaml`，支持 per-project Agent 集合 / findings 上限 / severity 阈值
+  - `project_configs/_default.yaml`：全局默认模板（agents/max_findings/min_severity/max_files）
+  - `src/project_config.py`：YAML 加载 + `lru_cache` + `filter_findings_by_config()`
+  - 集成到 `supervisor_node`（agent 白名单 + max_files 截断）和 `critic_node`（min_severity + max_findings 过滤）
+- [x] Docker 部署配置（uvicorn + MySQL + Redis + ES 一键启动）
+  - `Dockerfile`：Python 3.11 slim，依赖缓存层
+  - `docker-compose.yml`：app + mcp + mysql + redis + elasticsearch，含 healthcheck
+  - `.env.example`：补全所有配置项
+- [x] 单元测试补充（分布式锁逻辑 / 规则引擎 / DB repository）
+  - `tests/test_concurrency_and_db.py`：20 个测试，覆盖 MR 锁 / 全局信号量 / repository CRUD / per-project 配置
+  - 全套 74 个测试全部通过
 - [ ] README 完善（含效果截图 + 快速开始）
 
 ---

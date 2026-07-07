@@ -16,6 +16,7 @@ redis>=8.0.1
 elasticsearch>=9.4.1
 
 # 工具
+pyyaml>=6.0.2
 httpx>=0.28.1
 tenacity>=9.1.4
 pydantic>=2.13.4

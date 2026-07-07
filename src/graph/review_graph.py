@@ -28,6 +28,7 @@ from src.agents.security_agent import run_security_agent
 from src.agents.summary_agent import run_summary_agent
 from src.agents.supervisor import get_focus_hints, run_supervisor
 from src.config import settings
+from src.project_config import filter_findings_by_config, get_enabled_agents, get_max_files
 from src.tools.gitcode_client import GitCodeClient
 
 logger = logging.getLogger(__name__)
@@ -708,13 +709,13 @@ _AI_INLINE_RE = re.compile(r"[🔴🟠🟡🔵] \*\*\[(?:CRITICAL|HIGH|MEDIUM|LO
 
 
 def _parse_reported_keys(comments: list[dict]) -> set[tuple]:
-    """从已有评论中提取已报告发现的三元组 (file, line_start, desc_40)，用于跨轮去重。
+    """从已有评论中提取已报告发现的位置 (file, line_start)，用于跨 review-run 去重。
 
-    业界标准：同一行不同发现应各自独立 comment，因此去重粒度是「同文件+同行+同描述前40字」，
-    而不是「同文件+同行」，避免同行第二条不同发现被误判为"已报告"而跳过。
+    跨 run 去重粒度：(file, line) 二元组。
+    同一行只要已有 AI inline comment，当前 run 就不再重复发布——LLM 每次措辞略有不同，
+    用 description[:40] 作 key 会导致同行同问题被反复报告。
 
-    用 emoji+severity 格式识别我们的 AI inline comment，而非 Agent 名称
-    （body 里不包含 Agent 名称）。
+    同 run 内多 agent 发现不同问题的场景由 synthesize_node 的三元组去重处理。
     """
     reported: set[tuple] = set()
     file_line_re = re.compile(r"`([^`:\n]+):(\d+)`")
@@ -725,16 +726,7 @@ def _parse_reported_keys(comments: list[dict]) -> set[tuple]:
         m = file_line_re.search(body)
         if not m:
             continue
-        fname = m.group(1)
-        line = int(m.group(2))
-        # 提取描述文本：标题行（emoji+severity+location）之后第一行非空文本
-        desc_snippet = ""
-        for ln in body.split("\n")[2:]:
-            stripped = ln.strip()
-            if stripped and not stripped.startswith("`") and not stripped.startswith("```"):
-                desc_snippet = stripped[:40]
-                break
-        reported.add((fname, line, desc_snippet))
+        reported.add((m.group(1), int(m.group(2))))
     return reported
 
 
@@ -904,11 +896,26 @@ async def supervisor_node(state: ReviewState) -> dict:
 
     if iteration == 0:
         # 首轮：规则引擎（确定性，0 LLM 成本）派遣 + LLM Advisor 注入 focus_hints
+        project_id = state["project_id"]
         files = state.get("file_list", [])
         languages = state.get("languages", [])
         pr_stats = state.get("pr_stats", {})
 
+        # Per-project max_files：截断文件列表（0 = 不限制）
+        max_files = get_max_files(project_id)
+        if max_files > 0 and len(files) > max_files:
+            logger.info("project config max_files=%d, truncating from %d files", max_files, len(files))
+            files = files[:max_files]
+
         base_tasks = _rule_engine_dispatch(files, languages, tier, pr_stats)
+
+        # Per-project agent whitelist：空列表 = 不限制，使用规则引擎结果
+        allowed = get_enabled_agents(project_id)
+        if allowed:
+            allowed_set = set(allowed)
+            before = [t["agent_type"] for t in base_tasks]
+            base_tasks = [t for t in base_tasks if t["agent_type"] in allowed_set]
+            logger.info("project config agent whitelist=%s (was %s)", allowed, before)
         # small PR：文件少、路径明确，规则引擎启发已足够，跳过 LLM Advisor 节省 ~20s
         if tier == "small":
             hints: dict[str, str] = {}
@@ -1207,6 +1214,11 @@ def critic_node(state: ReviewState) -> dict:
             continue
         kept.append(finding)
 
+    # Per-project min_severity + max_findings filter
+    project_id = state.get("project_id", "")
+    if project_id:
+        kept = filter_findings_by_config(kept, project_id)
+
     return {"final_findings": kept}
 
 
@@ -1232,7 +1244,7 @@ async def publish_node(state: ReviewState) -> dict:
         logger.warning("get_pr_comments failed, skipping dedup: %s", e)
 
     def _reported_key(f: dict) -> tuple:
-        return (f.get("file", ""), f.get("line_start", 0), f.get("description", "")[:40])
+        return (f.get("file", ""), f.get("line_start", 0))
 
     new_findings = [f for f in final_findings if _reported_key(f) not in already_reported]
     skipped_findings = [f for f in final_findings if _reported_key(f) in already_reported]

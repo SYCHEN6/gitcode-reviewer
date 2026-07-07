@@ -53,11 +53,32 @@
 
 ## 快速开始
 
+### 方式一：Docker 一键启动（推荐）
+
 ```bash
 # 克隆项目
 git clone <repo-url>
 cd gitcode-reviewer
 
+# 配置环境变量（填入 LLM API Key 和 GitCode Token）
+cp .env.example .env
+vim .env
+
+# 启动所有服务（MySQL + Redis + Elasticsearch + Webhook 服务 + MCP Server）
+docker compose up -d
+
+# 查看服务状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f app
+```
+
+> 首次启动时 Elasticsearch 需要约 30 秒初始化，app 服务会等待其健康后再启动。
+
+### 方式二：本地开发
+
+```bash
 # 创建虚拟环境并安装依赖
 uv venv
 uv pip install -r requirements.txt
@@ -66,8 +87,40 @@ uv pip install -r requirements.txt
 cp .env.example .env
 # 编辑 .env 填入 API Key 等配置
 
-# 启动服务
+# 启动 Webhook 服务（端口 8080）
 uvicorn src.webhook.main:app --host 0.0.0.0 --port 8080 --reload
+
+# 可选：启动 MCP Server（端口 8081）
+python -m src.mcp.gitcode_server
+```
+
+## Per-project 配置
+
+在 `project_configs/` 目录下为每个项目创建专属配置文件（文件名格式：`{owner}__{repo}.yaml`）：
+
+```bash
+# 以 chensiyu47/MindIE-SD 为例
+cp project_configs/_default.yaml project_configs/chensiyu47__MindIE-SD.yaml
+vim project_configs/chensiyu47__MindIE-SD.yaml
+```
+
+支持以下配置项：
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `agents` | 允许运行的 Agent 列表（空 = 由规则引擎决定） | `[]` |
+| `max_findings` | 每次检视最多输出的问题数（0 = 不限制） | `30` |
+| `min_severity` | 最低 severity 阈值（`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`） | `LOW` |
+| `max_files` | 每次检视最多分析的文件数（0 = 不限制） | `0` |
+
+示例（只运行安全检查 + 逻辑检查，不输出 LOW 级别问题）：
+
+```yaml
+agents:
+  - SecurityAgent
+  - LogicAgent
+min_severity: MEDIUM
+max_findings: 20
 ```
 
 ## 项目结构
@@ -86,15 +139,28 @@ gitcode-reviewer/
 │   ├── mcp/
 │   │   └── gitcode_server.py  # GitCode MCP Server
 │   ├── tools/
-│   │   ├── gitcode_client.py  # GitCode REST API 封装
-│   │   └── ingest_norms.py    # 知识库初始化（文档 → ES 父子分块入库）
+│   │   ├── gitcode_client.py    # GitCode REST API 封装
+│   │   ├── norm_retriever.py    # ES 知识库检索（kNN + BM25 混合）
+│   │   └── ingest_norms.py      # 知识库初始化 CLI
+│   ├── db/
+│   │   └── repository.py        # SQLAlchemy async 持久化层
+│   ├── project_config.py        # Per-project 配置加载
 │   └── webhook/
-│       └── main.py            # FastAPI 入口 + Webhook 处理
+│       ├── main.py              # FastAPI 入口
+│       └── handlers.py          # Webhook 事件处理 + 命令系统
+├── project_configs/
+│   └── _default.yaml            # Per-project 配置模板
 ├── docs/
-│   ├── ARCHITECTURE.md        # 详细架构设计
-│   └── ROADMAP.md             # 开发路线图
+│   ├── ARCHITECTURE.md          # 详细架构设计
+│   └── ROADMAP.md               # 开发路线图
 ├── tests/
-├── .env
+│   ├── test_review_logic.py     # 核心逻辑 54 个测试
+│   ├── test_concurrency_and_db.py  # 并发控制 + DB 20 个测试
+│   ├── test_gitcode_client.py   # GitCode API 客户端测试
+│   └── test_webhook.py          # Webhook 入口测试
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 └── requirements.txt
 ```
 

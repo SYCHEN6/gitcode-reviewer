@@ -1,0 +1,17 @@
+# Per-project AI Reviewer configuration template
+# Copy to project_configs/{owner}__{repo}.yaml (replace "/" with "__") and customize.
+# All fields are optional — omit to use the defaults below.
+
+# Agent 集合（留空 = 由规则引擎自动决定）
+# 可选值：SecurityAgent, LogicAgent, QualityAgent, PerformanceAgent
+agents: []
+
+# 每次检视最多输出的 finding 数量（0 = 不限制）
+max_findings: 30
+
+# 最低 severity 阈值（CRITICAL / HIGH / MEDIUM / LOW）
+# 低于此阈值的 finding 不写回 MR 评论
+min_severity: "LOW"
+
+# 每次检视最多分析的文件数（0 = 使用全局 token 预算限制）
+max_files: 0
