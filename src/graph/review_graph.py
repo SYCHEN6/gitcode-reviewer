@@ -1147,6 +1147,12 @@ def synthesize_node(state: ReviewState) -> dict:
             unique.append(f)
 
     final = sorted(unique, key=lambda f: _severity_order(f.get("severity", "LOW")))
+
+    # 为每条 finding 分配稳定的 UUID，供 suggestion_status 追踪
+    for f in final:
+        if not f.get("finding_id"):
+            f["finding_id"] = uuid.uuid4().hex
+
     return {"final_findings": final}
 
 
@@ -1213,6 +1219,7 @@ async def publish_node(state: ReviewState) -> dict:
     diffs = state.get("diffs", [])
     final_findings = state.get("final_findings", [])
     summary = state.get("summary", {})
+    task_id = state.get("task_id", "")
 
     # ── 1. 跨轮去重：获取已有 AI 评论，提取 (file, line_start) ─────────────
     existing_comments: list[dict] = []
@@ -1256,13 +1263,26 @@ async def publish_node(state: ReviewState) -> dict:
 
         try:
             if actual_line and head_sha and fname:
-                await gc.post_inline_comment(
+                result = await gc.post_inline_comment(
                     project_id, mr_iid, body,
                     {"head_sha": head_sha, "new_path": fname, "new_line": actual_line},
                 )
             else:
-                await gc.post_mr_note(project_id, mr_iid, body)
+                result = await gc.post_mr_note(project_id, mr_iid, body)
             posted += 1
+            # 有 suggestion block 的评论写入 suggestion_status（供 push webhook 追踪）
+            if finding.get("suggestion_code") is not None and task_id:
+                finding_id = finding.get("finding_id", "")
+                comment_id = result.get("comment_id", 0) if result else 0
+                if finding_id:
+                    try:
+                        from src.db import repository as _repo
+                        await _repo.save_suggestion(
+                            task_id, finding_id, project_id, mr_iid,
+                            comment_id, fname, line_start,
+                        )
+                    except Exception as _db_exc:
+                        logger.debug("save_suggestion skipped: %s", _db_exc)
         except Exception as e:
             logger.error("publish comment failed (file=%s line=%s): %s", fname, line_start, e)
             try:
@@ -1417,6 +1437,48 @@ async def _write_review_metrics(
         )
     except Exception as e:
         logger.warning("Failed to write review metrics to Redis: %s", e)
+
+
+async def run_summary_only(project_id: str, mr_iid: int) -> None:
+    """/ai summary 命令：仅生成 PR 摘要，不运行专家 Agent。"""
+    gc = GitCodeClient(settings.GITCODE_BASE_URL, settings.GITCODE_TOKEN)
+    try:
+        diff_data = await gc.get_pr_diff(project_id, mr_iid)
+        raw_diff  = diff_data.get("diff", "")
+        files     = diff_data.get("files", [])
+        pr_stats  = _calc_pr_stats(diff_data.get("diffs", []))
+    except Exception as e:
+        logger.error("run_summary_only: get_pr_diff failed: %s", e)
+        return
+
+    try:
+        summary = await run_summary_agent(files, raw_diff, [])
+    except Exception as e:
+        logger.error("run_summary_only: summary_agent failed: %s", e)
+        return
+
+    try:
+        existing = await gc.get_pr_comments(project_id, mr_iid)
+        old_c    = _find_ai_summary_comment(existing)
+        run_count = (_parse_run_count(old_c.get("body", "") or "") if old_c else 0) + 1
+        now_str   = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ai_section = _build_ai_section(
+            summary=summary,
+            all_findings=[],
+            new_findings=[],
+            skipped_findings=[],
+            run_count=run_count,
+            now_str=now_str,
+            pr_stats=pr_stats,
+        )
+        if old_c:
+            await gc.update_pr_comment(project_id, mr_iid, old_c["id"], ai_section)
+            logger.info("run_summary_only: updated summary comment (run #%d)", run_count)
+        else:
+            await gc.post_mr_note(project_id, mr_iid, ai_section)
+            logger.info("run_summary_only: posted summary comment (run #%d)", run_count)
+    except Exception as e:
+        logger.error("run_summary_only: post comment failed: %s", e)
 
 
 async def run_review_graph(project_id: str, mr_iid: int, commit_sha: str) -> None:

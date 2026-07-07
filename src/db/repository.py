@@ -88,12 +88,27 @@ CREATE TABLE IF NOT EXISTS suggestion_status (
     id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
     task_id      VARCHAR(64)  NOT NULL,
     finding_id   VARCHAR(64)  NOT NULL,
+    project_id   VARCHAR(255),
+    mr_iid       INT,
+    comment_id   BIGINT,
+    file_path    VARCHAR(500),
+    line_start   INT,
     status       VARCHAR(20)  NOT NULL DEFAULT 'pending',
     applied_at   DATETIME,
-    INDEX        idx_finding (finding_id),
-    INDEX        idx_task (task_id)
+    UNIQUE KEY   uq_finding (finding_id),
+    INDEX        idx_task (task_id),
+    INDEX        idx_project_mr (project_id, mr_iid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
+
+# 旧版本升级：为已有表补充缺失列（幂等，MySQL 8.0+ 支持 IF NOT EXISTS）
+_ALTER_SUGGESTION_STATUS = [
+    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS project_id VARCHAR(255)",
+    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS mr_iid INT",
+    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS comment_id BIGINT",
+    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS file_path VARCHAR(500)",
+    "ALTER TABLE suggestion_status ADD COLUMN IF NOT EXISTS line_start INT",
+]
 
 
 async def init_tables() -> None:
@@ -102,6 +117,11 @@ async def init_tables() -> None:
     async with engine.begin() as conn:
         for ddl in (_CREATE_REVIEW_TASKS, _CREATE_REVIEW_RESULTS, _CREATE_SUGGESTION_STATUS):
             await conn.execute(text(ddl))
+        for alter in _ALTER_SUGGESTION_STATUS:
+            try:
+                await conn.execute(text(alter))
+            except Exception:
+                pass  # 列已存在或 MySQL 版本不支持 IF NOT EXISTS，忽略
     logger.info("DB tables initialized (or already exist)")
 
 
@@ -250,3 +270,66 @@ async def fail_task(task_id: str, error: str = "") -> None:
             {"err": error[:2000], "now": datetime.now(), "tid": task_id},
         )
         await session.commit()
+
+
+async def save_suggestion(
+    task_id: str,
+    finding_id: str,
+    project_id: str,
+    mr_iid: int,
+    comment_id: int,
+    file_path: str,
+    line_start: int,
+) -> None:
+    """记录一条已发布的 suggestion（状态=pending）。"""
+    _get_engine()
+    assert _SessionLocal is not None
+
+    async with _SessionLocal() as session:
+        await session.execute(
+            text(
+                "INSERT IGNORE INTO suggestion_status "
+                "(task_id, finding_id, project_id, mr_iid, comment_id, file_path, line_start, status) "
+                "VALUES (:tid, :fid, :pid, :mr, :cid, :fp, :ln, 'pending')"
+            ),
+            {
+                "tid": task_id,
+                "fid": finding_id,
+                "pid": project_id,
+                "mr":  mr_iid,
+                "cid": comment_id,
+                "fp":  file_path,
+                "ln":  line_start,
+            },
+        )
+        await session.commit()
+
+
+async def mark_suggestions_applied(project_id: str, file_paths: list[str]) -> int:
+    """将指定项目中匹配文件路径的 pending suggestions 标记为 applied。
+
+    Push 事件 "Apply suggestion" commit 触发此函数。
+    返回更新的行数。
+    """
+    if not file_paths:
+        return 0
+    _get_engine()
+    assert _SessionLocal is not None
+
+    placeholders = ", ".join(f":fp{i}" for i in range(len(file_paths)))
+    params: dict = {"pid": project_id, "now": datetime.now()}
+    for i, fp in enumerate(file_paths):
+        params[f"fp{i}"] = fp
+
+    async with _SessionLocal() as session:
+        result = await session.execute(
+            text(
+                f"UPDATE suggestion_status "
+                f"SET status='applied', applied_at=:now "
+                f"WHERE project_id=:pid AND status='pending' "
+                f"AND file_path IN ({placeholders})"
+            ),
+            params,
+        )
+        await session.commit()
+        return result.rowcount

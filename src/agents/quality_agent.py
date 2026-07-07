@@ -78,6 +78,14 @@ _PROMPT = """你是代码整洁度和可维护性专家，遵循 Clean Code 和 
 - 删除某行时，suggestion_code 填空字符串 `""`（空）
 - 仅在修复涉及大规模重构（跨多个文件）时才可省略 suggestion_code 字段
 
+## 团队规范检索（RAG）
+当你发现可能违反团队规范的问题时，**调用 `search_team_norms(query)` 检索相关规范**：
+- query 填写问题关键词，如 "函数命名规范"、"错误处理规范"、"日志输出"
+- 若检索到相关规范，在对应 finding 的 `norm_reference` 字段填写规范摘要（50 字以内）
+- 若未检索到，`norm_reference` 留空或省略
+
+`norm_reference` 示例：`"团队规范：禁止在业务逻辑层调用 print()，须使用 logger"`
+
 输出 JSON 数组，无问题返回 []，只输出 JSON，不要其他文字。"""
 
 

@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     MYSQL_URL: str = ""
     REDIS_URL: str = "redis://localhost:6379"
     ES_URL: str = "http://localhost:9200"
+    EMBEDDING_MODEL: str = "text-embedding-v2"   # DashScope embedding 模型
+    EMBEDDING_DIMS:  int = 1536                   # text-embedding-v2 输出维度
 
     MCP_SERVER_HOST: str = "localhost"
     MCP_SERVER_PORT: int = 8081

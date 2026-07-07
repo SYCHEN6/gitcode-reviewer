@@ -434,3 +434,110 @@ async def test_run_agents_saves_checkpoint_after_completion():
     assert call_args[0][1] == "QualityAgent"    # agent_type
     assert call_args[0][2] == findings          # findings
     assert call_args[1]["status"] == "completed"
+
+
+# ── synthesize_node: finding_id 分配 ─────────────────────────────────────────
+
+def test_synthesize_assigns_finding_ids():
+    """synthesize_node 的每条 final finding 都应有 finding_id (UUID hex)。"""
+    state = {
+        "findings": [
+            {"agent": "QualityAgent", "file": "a.py", "line_start": 10,
+             "severity": "HIGH", "description": "issue A"},
+            {"agent": "SecurityAgent", "file": "a.py", "line_start": 20,
+             "severity": "MEDIUM", "description": "issue B"},
+        ],
+        "diffs": [],
+    }
+    result = synthesize_node(state)
+    for f in result["final_findings"]:
+        assert "finding_id" in f
+        assert len(f["finding_id"]) == 32  # UUID hex
+
+
+def test_synthesize_finding_id_not_overwritten():
+    """已有 finding_id 的 finding 不应被重新分配。"""
+    state = {
+        "findings": [
+            {"agent": "QualityAgent", "file": "a.py", "line_start": 10,
+             "severity": "HIGH", "description": "issue A", "finding_id": "preset-id"},
+        ],
+        "diffs": [],
+    }
+    result = synthesize_node(state)
+    assert result["final_findings"][0]["finding_id"] == "preset-id"
+
+
+# ── handlers: 命令解析 ────────────────────────────────────────────────────────
+
+def test_handle_explain_parses_file_line():
+    """_handle_explain 能正确解析 /ai explain src/foo.py:42。"""
+    import re
+    note = "/ai explain src/foo.py:42"
+    m = re.search(r"/ai\s+explain\s+([^\s:]+):(\d+)(?:-(\d+))?", note)
+    assert m is not None
+    assert m.group(1) == "src/foo.py"
+    assert int(m.group(2)) == 42
+    assert m.group(3) is None
+
+
+def test_handle_explain_parses_range():
+    """_handle_explain 能解析 /ai explain src/foo.py:10-30 的行范围。"""
+    import re
+    note = "/ai explain src/foo.py:10-30"
+    m = re.search(r"/ai\s+explain\s+([^\s:]+):(\d+)(?:-(\d+))?", note)
+    assert m is not None
+    assert int(m.group(2)) == 10
+    assert int(m.group(3)) == 30
+
+
+@pytest.mark.asyncio
+async def test_handle_note_summary_triggers_background_task():
+    """/ai summary 命令应派发 run_summary_only 任务，不调用 run_review_graph。"""
+    from fastapi import BackgroundTasks
+    from unittest.mock import MagicMock, patch, AsyncMock
+
+    bt = MagicMock(spec=BackgroundTasks)
+    redis_mock = AsyncMock()
+    redis_mock.exists = AsyncMock(return_value=False)
+    redis_mock.setex  = AsyncMock()
+
+    payload = {
+        "object_attributes": {"noteable_type": "MergeRequest", "note": "/ai summary"},
+        "project":           {"path_with_namespace": "owner/repo"},
+        "merge_request":     {"iid": 1},
+    }
+
+    with patch("src.webhook.handlers.run_review_graph") as mock_review, \
+         patch("src.webhook.handlers.run_summary_only") as mock_summary:
+        from src.webhook.handlers import handle_note
+        await handle_note(payload, bt, redis_mock)
+
+    bt.add_task.assert_called_once_with(mock_summary, "owner/repo", 1)
+    mock_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_push_marks_applied_on_suggestion_commit():
+    """/push 事件检测到 Apply suggestion commit 时，应触发 mark_suggestions_applied。"""
+    from fastapi import BackgroundTasks
+    from unittest.mock import MagicMock, patch
+
+    bt = MagicMock(spec=BackgroundTasks)
+    payload = {
+        "project": {"path_with_namespace": "owner/repo"},
+        "commits": [
+            {
+                "id": "abc123",
+                "message": "Apply 1 suggestion (AI reviewer)",
+                "modified": ["src/foo.py"],
+                "added": [],
+            }
+        ],
+    }
+
+    with patch("src.webhook.handlers._mark_suggestions_applied") as mock_mark:
+        from src.webhook.handlers import handle_push
+        await handle_push(payload, bt)
+
+    bt.add_task.assert_called_once_with(mock_mark, "owner/repo", ["src/foo.py"])

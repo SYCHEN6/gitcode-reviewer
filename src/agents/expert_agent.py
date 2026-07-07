@@ -143,6 +143,32 @@ def _category_of(agent_type: str) -> str:
 _CONTEXT_PADDING = 20  # 行范围上下各扩展的行数
 
 
+def _make_norm_tool():
+    """创建团队规范检索工具（仅 QualityAgent 使用）。ES 不可用时返回 None。"""
+    try:
+        from src.tools.norm_retriever import search_norms
+
+        @lc_tool
+        async def search_team_norms(query: str, top_k: int = 3) -> str:
+            """检索团队规范知识库，返回与 query 最相关的规范内容（用于 norm_reference 回填）。
+
+            query: 检视发现的问题描述或关键词（中英文均可）
+            top_k: 返回条数（默认 3）
+            """
+            results = await search_norms(query, top_k=top_k)
+            if not results:
+                return "（知识库中未找到相关规范）"
+            parts = []
+            for i, r in enumerate(results, 1):
+                src = r.get("source", "")
+                parts.append(f"[规范 {i}] 来源：{src}\n{r.get('content', '')}")
+            return "\n\n---\n\n".join(parts)
+
+        return search_team_norms
+    except Exception:
+        return None
+
+
 def _make_file_tool(
     gc: GitCodeClient,
     project_id: str,
@@ -361,7 +387,16 @@ async def run_expert_agent(
     )
 
     file_tool = _make_file_tool(gc, project_id, head_sha, file_cache)
-    llm = _make_llm(model).bind_tools([file_tool])
+
+    # QualityAgent 额外绑定规范检索工具（ES 不可用时 norm_tool=None，降级为只有 file_tool）
+    tools_list = [file_tool]
+    if agent_type == "QualityAgent":
+        norm_tool = _make_norm_tool()
+        if norm_tool:
+            tools_list.append(norm_tool)
+    tool_map = {t.name: t for t in tools_list}
+
+    llm = _make_llm(model).bind_tools(tools_list)
 
     files_list = "\n".join(f"- {f}" for f in files)
     diff_text = diff_slice if diff_slice else "（无 diff 片段）"
@@ -452,10 +487,12 @@ async def run_expert_agent(
             logger.info("[%s] No tool calls on first iteration (sufficient context), falling back to prefetch", agent_type)
             return await _run_prefetch_fallback(agent_type, system_prompt, task, head_sha, gc, model, file_cache)
 
-        # 执行工具调用
+        # 执行工具调用（按名称路由到对应工具）
         for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_fn = tool_map.get(tool_name, file_tool)
             try:
-                result = await file_tool.ainvoke(tc["args"])
+                result = await tool_fn.ainvoke(tc["args"])
             except Exception as e:
                 result = f"[工具执行失败: {e}]"
             messages.append(ToolMessage(

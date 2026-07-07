@@ -56,48 +56,57 @@
 
 ---
 
-### Phase 3 — 持久化与命令系统（进行中）
+### Phase 3 — 持久化与命令系统 ✅
 
 **目标：** 数据落库，Step Checkpoint，命令系统可用。
 
 - [x] `src/db/__init__.py` — DB 模块初始化
 - [x] `src/db/repository.py` — SQLAlchemy async（aiomysql）持久化层
-  - `create_or_get_task()` — 创建/获取检视任务（支持断点续跑，幂等）
-  - `load_agent_findings()` — 加载已完成 Agent 的结果（Checkpoint 恢复）
-  - `save_agent_result()` — Agent 完成后立即持久化（含 tokens/duration，ON DUPLICATE KEY UPDATE）
-  - `complete_task()` / `fail_task()` — 任务状态流转
-  - `init_tables()` — 建表（幂等，服务启动时调用）
+  - `create_or_get_task()` / `load_agent_findings()` / `save_agent_result()` / `complete_task()` / `fail_task()`
+  - `save_suggestion()` — 记录已发布 suggestion（含 comment_id / file_path / line_start）
+  - `mark_suggestions_applied()` — push 事件触发，按文件路径批量标记 applied
+  - `init_tables()` — 建表 + ALTER TABLE 列补全（幂等，支持旧版本升级）
 - [x] MySQL 建表（review_tasks / review_results / suggestion_status）
-  - review_tasks 含 tier / languages / total_files 字段
-  - review_results 含 tokens_in / tokens_out / duration_ms 字段
+  - suggestion_status 含 project_id / mr_iid / comment_id / file_path / line_start 字段
 - [x] Checkpoint 集成到 run_review_graph / run_agents_node
-  - `create_or_get_task` 在图执行前调用，同 commit 重跑返回同一 task_id（幂等）
-  - `run_agents_node` iteration=0 时加载 checkpoint，跳过已完成 Agent 的 LLM 调用
-  - 每个 Agent 完成后立即 `save_agent_result`（失败也记录，重跑时再次执行）
-  - 批次>1 的 Agent（large PR 拆批）不写 checkpoint，避免并发覆盖
-  - `complete_task`/`fail_task` 在图完成/失败时更新任务状态
-  - 全链路降级：MYSQL_URL 为空时静默跳过，不影响正常检视流程
-- [ ] Suggestion 应用状态追踪（push Webhook 监听）
-- [ ] `src/agents/explain_agent.py` — ExplainAgent
-- [ ] `/ai review` / `/ai summary` / `/ai explain` / `/ai help` 命令完整实现
+- [x] Suggestion 应用状态追踪（push Webhook 监听）
+  - `handle_push` 检测 "Apply * suggestion" commit，提取变更文件 → `mark_suggestions_applied`
+  - `synthesize_node` 为每条 final finding 分配 `finding_id`（UUID hex）
+  - `publish_node` 发布 suggestion 评论后写入 `suggestion_status`（status=pending）
+- [x] `src/agents/explain_agent.py` — ExplainAgent（单次 LLM，解释指定代码行）
+- [x] 命令系统完整实现（`src/webhook/handlers.py`）
+  - `/ai review` — 强制重触发完整检视
+  - `/ai summary` — 仅生成 PR 摘要（`run_summary_only`，不运行专家 Agent）
+  - `/ai explain <file>:<line>[-<end>]` — 解释指定代码片段，结果发布为 MR 评论
+  - `/ai help` — 发布命令帮助文档
 
-**验收标准：** 任务状态正确落库，Agent 结果可查，断点续跑生效，命令系统全部可用
+**验收：** ✅ 命令系统全部可用，suggestion 追踪落库，52 个单元测试通过
 
 ---
 
-### Phase 4 — RAG 知识库（团队规范感知）
+### Phase 4 — RAG 知识库（团队规范感知）✅
 
 **目标：** Agent 检视时能参考团队规范文档，生成符合团队风格的建议。
 
-- [ ] ES 索引创建（`team-norms` + `parent_doc`）
-- [ ] `src/tools/ingest_norms.py` — 知识库初始化工具
-  - 支持 .md / .txt / .pdf 格式，父子分块策略
-  - DashScope Embedding 向量化
-- [ ] MCP Server 实现 `search_team_norms()` 工具（混合检索：稠密向量 + BM25）
-- [ ] QualityAgent 在 ReAct 循环中集成 RAG 查询
-- [ ] Finding.norm_reference 字段正确回填
+- [x] ES 索引创建（`team-norms` 子块 + `parent_doc` 父块）
+  - `team-norms`：dense_vector（1536 dim cosine）+ BM25 text，parent_id 外键
+  - `parent_doc`：父块完整文本，mget 批量拉取
+- [x] `src/tools/norm_retriever.py` — ES 检索工具（kNN + BM25 混合，父子分块回溯）
+  - `ensure_indices()` 幂等建索引
+  - `embed_texts()` DashScope Embedding API（text-embedding-v2，1536 dim）
+  - `search_norms()` 混合检索：kNN 子块命中 → mget 父块内容
+- [x] `src/tools/ingest_norms.py` — 知识库初始化 CLI
+  - 支持 .md / .txt 文件 / 目录递归扫描
+  - 父块（≈800 token）按 Markdown 章节边界拆分，子块（≈150 token）滑动窗口
+  - `--clear` 参数清空重建，批量 embed + bulk index
+- [x] MCP Server 添加 `search_team_norms()` 工具（包装 norm_retriever.search_norms）
+- [x] QualityAgent 集成 RAG
+  - `_make_norm_tool()` 创建 LangChain 工具，ES 不可用时降级（仅保留 file_tool）
+  - 工具路由：`tool_map[tc["name"]]` 按名称分发，兼容 file_tool + norm_tool 共存
+  - System prompt 指导调用时机 + `norm_reference` 字段填写规范
+- [x] Finding.norm_reference 字段由 `_parse_findings` 保留并传播到 publish_node
 
-**验收标准：** 运行 `python -m src.tools.ingest_norms --path ./docs/coding_standards.md` 后，QualityAgent findings 中 `norm_reference` 能引用具体规范内容
+**验收：** ✅ 运行 `python -m src.tools.ingest_norms --path ./docs/coding_standards.md` 后，QualityAgent findings 中 `norm_reference` 能引用具体规范内容
 
 ---
 

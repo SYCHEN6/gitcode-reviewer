@@ -94,5 +94,23 @@ async def update_mr_label(project_id: str, mr_iid: int, labels: list[str]) -> di
     return await _client.update_mr_label(project_id, mr_iid, labels)
 
 
+# ── 知识库检索工具（RAG，QualityAgent 使用）─────────────────────────────────
+
+@mcp.tool()
+async def search_team_norms(query: str, top_k: int = 3) -> list[dict]:
+    """检索团队规范知识库，返回与 query 最相关的规范内容。
+
+    使用父子分块策略：子块（≈150 token）向量检索命中后，返回对应父块（≈800 token）完整内容，
+    提供足够的上下文给 QualityAgent 生成精准的合规建议。
+
+    返回列表，每项包含：
+    - content: 父块完整文本（≈800 token）
+    - source:  来源文件名
+    - score:   相关性评分
+    """
+    from src.tools.norm_retriever import search_norms
+    return await search_norms(query, top_k=top_k)
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
