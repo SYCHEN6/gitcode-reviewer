@@ -21,9 +21,8 @@ import argparse
 import asyncio
 import json
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from _common import *
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client

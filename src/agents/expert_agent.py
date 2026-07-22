@@ -169,6 +169,18 @@ def _make_norm_tool():
         return None
 
 
+# ── Agent 工具注册表 ────────────────────────────────────────────────────────
+# 每个 Agent 类型可声明自己的额外工具工厂函数。
+# 工厂函数签名为: () -> BaseTool | None（ES 不可用时返回 None 降级）。
+# file_tool 是所有 Agent 的通用工具，由 run_expert_agent 统一注入，无需注册。
+
+_AGENT_TOOL_REGISTRY: dict[str, list] = {
+    "QualityAgent": [_make_norm_tool],
+    # 添加新 Agent 工具示例：
+    # "SecurityAgent": [_make_security_tool],
+}
+
+
 def _make_file_tool(
     gc: GitCodeClient,
     project_id: str,
@@ -388,14 +400,18 @@ async def run_expert_agent(
         agent_type, len(hunk_ranges), len(new_files), len(diff_slice),
     )
 
+    # 通用工具：所有 Agent 都能读取文件
     file_tool = _make_file_tool(gc, project_id, head_sha, file_cache)
-
-    # QualityAgent 额外绑定规范检索工具（ES 不可用时 norm_tool=None，降级为只有 file_tool）
     tools_list = [file_tool]
-    if agent_type == "QualityAgent":
-        norm_tool = _make_norm_tool()
-        if norm_tool:
-            tools_list.append(norm_tool)
+
+    # 从注册表加载 Agent 专属额外工具
+    for tool_factory in _AGENT_TOOL_REGISTRY.get(agent_type, []):
+        try:
+            extra_tool = tool_factory()
+            if extra_tool is not None:
+                tools_list.append(extra_tool)
+        except Exception as _tool_err:
+            logger.debug("[%s] failed to create extra tool: %s", agent_type, _tool_err)
     tool_map = {t.name: t for t in tools_list}
 
     llm = _make_llm(model).bind_tools(tools_list)

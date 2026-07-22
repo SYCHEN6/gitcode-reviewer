@@ -18,16 +18,9 @@ import asyncio
 import logging
 import sys
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Windows GBK 终端强制 UTF-8 输出
-if sys.platform == "win32":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from _common import *
 
 # ── 日志配置（详细级别，追踪每个节点）──────────────────────────────────────
 logging.basicConfig(

@@ -14,17 +14,11 @@
 
 import argparse
 import asyncio
-import io
 import logging
 import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from _common import *
 
 logging.basicConfig(
     level=logging.WARNING,

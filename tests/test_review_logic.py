@@ -345,8 +345,8 @@ async def test_supervisor_node_iteration0_uses_rule_engine():
         "pr_stats": {"tier": "medium", "lines_added": 200, "lines_removed": 50, "files": 5},
         "iteration": 0,
     }
-    with patch("src.graph.review_graph.get_focus_hints", new_callable=AsyncMock) as mock_hints, \
-         patch("src.graph.review_graph.run_supervisor", new_callable=AsyncMock) as mock_sup:
+    with patch("src.graph.nodes.supervisor.get_focus_hints", new_callable=AsyncMock) as mock_hints, \
+         patch("src.graph.nodes.supervisor.run_supervisor", new_callable=AsyncMock) as mock_sup:
         mock_hints.return_value = {"SecurityAgent": "关注 JWT 处理"}
         result = await supervisor_node(medium_state)
 
@@ -359,8 +359,8 @@ async def test_supervisor_node_iteration0_uses_rule_engine():
 @pytest.mark.asyncio
 async def test_supervisor_node_iteration1_uses_llm():
     """iteration>0 必须走 LLM Supervisor，不走规则引擎。"""
-    with patch("src.graph.review_graph.get_focus_hints", new_callable=AsyncMock) as mock_hints, \
-         patch("src.graph.review_graph.run_supervisor", new_callable=AsyncMock) as mock_sup:
+    with patch("src.graph.nodes.supervisor.get_focus_hints", new_callable=AsyncMock) as mock_hints, \
+         patch("src.graph.nodes.supervisor.run_supervisor", new_callable=AsyncMock) as mock_sup:
         mock_sup.return_value = {"action": "FINISH", "reasoning": "足够了", "agents_to_dispatch": []}
         state = {**_BASE_STATE, "iteration": 1}
         result = await supervisor_node(state)
@@ -388,7 +388,7 @@ async def test_run_agents_checkpoint_skips_completed_agent():
     """Checkpoint 命中时，已完成的 Agent 不调用 LLM，直接返回缓存结果。"""
     cached = [{"file": "f.py", "line_start": 1, "severity": "HIGH", "description": "cached finding"}]
 
-    with patch("src.graph.review_graph.run_security_agent", new_callable=AsyncMock) as mock_agent, \
+    with patch("src.graph.dispatch.run_security_agent", new_callable=AsyncMock) as mock_agent, \
          patch("src.db.repository.load_agent_findings", new_callable=AsyncMock) as mock_load, \
          patch("src.db.repository.save_agent_result", new_callable=AsyncMock):
         mock_load.return_value = {"SecurityAgent": cached}
@@ -407,7 +407,7 @@ async def test_run_agents_checkpoint_not_applied_on_iteration1():
 
     # _AGENT_MAP 在模块导入时绑定函数引用，必须用 patch.dict 替换 dict 条目
     agent_mock = AsyncMock(return_value=fresh)
-    with patch.dict("src.graph.review_graph._AGENT_MAP", {"SecurityAgent": agent_mock}), \
+    with patch.dict("src.graph.nodes.run_agents.AGENT_MAP", {"SecurityAgent": agent_mock}), \
          patch("src.db.repository.load_agent_findings", new_callable=AsyncMock) as mock_load, \
          patch("src.db.repository.save_agent_result", new_callable=AsyncMock):
         mock_load.return_value = {"SecurityAgent": cached}
